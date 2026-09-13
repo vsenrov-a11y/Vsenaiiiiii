@@ -1,0 +1,93 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "User profile, orb wallet balance, preferences and shared settings",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "email": { "type": "string" },
+        "name": { "type": "string" },
+        "avatar": { "type": "string" },
+        "orbBalance": { "type": "number" },
+        "theme": { "type": "string" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id"]
+    },
+    "Character": {
+      "title": "Character",
+      "description": "User created or customized companion persona",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "tagline": { "type": "string" },
+        "description": { "type": "string" },
+        "avatar": { "type": "string" },
+        "isCustom": { "type": "boolean" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "name"]
+    },
+    "World": {
+      "title": "World",
+      "description": "User created or customized interactive world",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "type": "string" },
+        "description": { "type": "string" },
+        "coverImage": { "type": "string" },
+        "isCustom": { "type": "boolean" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "name"]
+    },
+    "ChatSession": {
+      "title": "ChatSession",
+      "description": "Conversation history with messages and scene states",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "personaId": { "type": "string" },
+        "timestamp": { "type": "string" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "personaId"]
+    },
+    "Asset": {
+      "title": "Asset",
+      "description": "Persisted media binary / data asset",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "data": { "type": "string" },
+        "updatedAt": { "type": "number" }
+      },
+      "required": ["id", "data"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Root user preferences and profile document"
+    },
+    "/users/{userId}/characters/{charId}": {
+      "schema": { "$ref": "#/entities/Character" },
+      "description": "User characters collection"
+    },
+    "/users/{userId}/worlds/{worldId}": {
+      "schema": { "$ref": "#/entities/World" },
+      "description": "User custom worlds collection"
+    },
+    "/users/{userId}/chats/{chatId}": {
+      "schema": { "$ref": "#/entities/ChatSession" },
+      "description": "User chat sessions collection"
+    },
+    "/users/{userId}/assets/{assetId}": {
+      "schema": { "$ref": "#/entities/Asset" },
+      "description": "User uploaded assets collection"
+    }
+  }
+}

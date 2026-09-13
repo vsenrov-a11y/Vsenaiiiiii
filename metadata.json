@@ -1,0 +1,6 @@
+{
+  "name": "Vsen.Ai",
+  "description": "Premium ultra-minimalist AI chat application inspired by native iOS and Samsung One UI design language.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

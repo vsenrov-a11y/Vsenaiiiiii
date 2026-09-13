@@ -1,0 +1,297 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;700&family=JetBrains+Mono:wght@300;400;500;700&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-bg-charcoal: #121214;
+  --color-accent: #AAAAAA;
+  --color-accent-hover: #888888;
+
+  --animate-fadeIn: fadeIn 0.15s ease-out forwards;
+  --animate-scaleIn: scaleIn 0.15s ease-out forwards;
+  --animate-slideUp: slideUp 0.18s ease-out forwards;
+  --animate-popIn: popIn 0.15s ease-out forwards;
+  --animate-fadeBlur: fadeBlur 0.1s ease-out forwards;
+
+  @keyframes fadeIn {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+  @keyframes fadeBlur {
+    from { opacity: 0.4; }
+    to { opacity: 1; }
+  }
+  @keyframes scaleIn {
+    from { transform: scale(0.96); opacity: 0; }
+    to { transform: scale(1); opacity: 1; }
+  }
+  @keyframes slideUp {
+    from { transform: translateY(12px); opacity: 0; }
+    to { transform: translateY(0); opacity: 1; }
+  }
+  @keyframes popIn {
+    from { transform: scale(0.96) translateY(3px); opacity: 0; }
+    to { transform: scale(1) translateY(0); opacity: 1; }
+  }
+  @keyframes liveWallpaperPanEndToEnd {
+    0% {
+      transform: translate3d(0, 0, 0);
+    }
+    50% {
+      transform: translate3d(var(--max-pan, calc(100cqw - 100%)), 0, 0);
+    }
+    100% {
+      transform: translate3d(0, 0, 0);
+    }
+  }
+}
+
+.animate-liveWallpaperPan {
+  animation: liveWallpaperPanEndToEnd var(--pan-duration, 65s) cubic-bezier(0.37, 0, 0.63, 1) infinite;
+  will-change: transform;
+}
+
+.animate-liveWallpaper {
+  animation: liveWallpaperPanEndToEnd var(--pan-duration, 65s) cubic-bezier(0.37, 0, 0.63, 1) infinite;
+  will-change: transform;
+}
+
+@utility scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+  &::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+/* Real Light Theme Overrides */
+.theme-light {
+  background-color: #F8F9FA !important;
+  color: #1C1C1E !important;
+}
+
+.theme-light .bg-charcoal,
+.theme-light .bg-\[\#121214\],
+.theme-light .bg-\[\#111\],
+.theme-light .bg-\[\#121215\] {
+  background-color: #F8F9FA !important;
+}
+
+.theme-light .bg-\[\#18181c\],
+.theme-light .bg-\[\#1a1a1e\],
+.theme-light .bg-\[\#1c1c1e\],
+.theme-light .bg-\[\#161618\],
+.theme-light .bg-\[\#111112\]\/95,
+.theme-light .bg-\[\#161618\]\/95,
+.theme-light .bg-\[\#1A1A1A\],
+.theme-light .bg-\[\#1A1A1A\]\/90,
+.theme-light .bg-\[\#1E1E1E\]\/40 {
+  background-color: #FFFFFF !important;
+}
+
+.theme-light .bg-\[\#1E1E1E\],
+.theme-light .bg-\[\#1E1E22\],
+.theme-light .bg-\[\#1E1E24\],
+.theme-light .bg-\[\#121214\]\/98,
+.theme-light .bg-\[\#121214\]\/95 {
+  background-color: #FFFFFF !important;
+}
+
+.theme-light .bg-white\/\[0\.01\],
+.theme-light .bg-white\/\[0\.02\],
+.theme-light .bg-white\/\[0\.03\],
+.theme-light .bg-white\/\[0\.04\],
+.theme-light .bg-white\/\[0\.04\]\/40 {
+  background-color: rgba(0, 0, 0, 0.02) !important;
+}
+
+.theme-light .bg-white\/\[0\.05\],
+.theme-light .bg-white\/\[0\.06\],
+.theme-light .bg-white\/\[0\.08\],
+.theme-light .bg-white\/5,
+.theme-light .bg-white\/10 {
+  background-color: rgba(0, 0, 0, 0.04) !important;
+}
+
+.theme-light .bg-white\/15,
+.theme-light .bg-white\/20,
+.theme-light .bg-white\/\[0\.15\],
+.theme-light .bg-white\/\[0\.2\] {
+  background-color: rgba(0, 0, 0, 0.06) !important;
+}
+
+/* Hard text color overrides for perfect contrast on light themes */
+.theme-light .text-white,
+.theme-light .text-white\/90 {
+  color: #1C1C1E !important;
+}
+
+.theme-light .text-white\/80,
+.theme-light .text-white\/70,
+.theme-light .text-slate-200,
+.theme-light .text-slate-300 {
+  color: #2C2C2E !important;
+}
+
+.theme-light .text-white\/60,
+.theme-light .text-white\/50,
+.theme-light .text-slate-400 {
+  color: #48484A !important;
+}
+
+.theme-light .text-white\/40,
+.theme-light .text-white\/30,
+.theme-light .text-white\/20,
+.theme-light .text-\[\#888\],
+.theme-light .text-\[\#aaa\],
+.theme-light .text-\[\#666\],
+.theme-light .text-\[\#999\],
+.theme-light .text-slate-500 {
+  color: #7A7A80 !important;
+}
+
+.theme-light .border-white\/\[0\.05\],
+.theme-light .border-white\/\[0\.06\],
+.theme-light .border-white\/\[0\.08\],
+.theme-light .border-white\/5,
+.theme-light .border-white\/10,
+.theme-light .border-white\/\[0\.04\] {
+  border-color: rgba(0, 0, 0, 0.08) !important;
+}
+
+.theme-light .border-white\/20,
+.theme-light .border-white\/30,
+.theme-light .border-white\/\[0\.16\] {
+  border-color: rgba(0, 0, 0, 0.12) !important;
+}
+
+/* Adjust Accent Color for Light Mode Contrast */
+.theme-light .text-accent {
+  color: #444444 !important;
+}
+.theme-light .bg-accent {
+  background-color: #444444 !important;
+}
+.theme-light .border-accent {
+  border-color: #444444 !important;
+}
+
+/* Keep text white inside solid primary accent or error/warning buttons */
+.theme-light button.bg-accent,
+.theme-light .bg-accent,
+.theme-light .bg-accent *,
+.theme-light button.bg-red-500,
+.theme-light .bg-red-500,
+.theme-light .bg-red-500 * {
+  color: #FFFFFF !important;
+}
+
+/* Shift active highlights and background tints to a beautiful, soft, neutral light-grey overlay */
+.theme-light .bg-accent\/5,
+.theme-light .bg-accent\/10,
+.theme-light .bg-accent\/15,
+.theme-light .bg-accent\/20,
+.theme-light .bg-accent\/25,
+.theme-light .bg-accent\/\[0\.02\],
+.theme-light .bg-accent\/\[0\.04\],
+.theme-light .bg-accent\/\[0\.06\],
+.theme-light .bg-accent\/\[0\.1\],
+.theme-light .bg-accent\/\[0\.12\],
+.theme-light .bg-accent\/\[0\.15\],
+.theme-light .bg-accent\/\[0\.2\],
+.theme-light .bg-accent\/\[0\.3\] {
+  background-color: rgba(0, 0, 0, 0.06) !important;
+}
+
+/* Remap border indicators on active pills or cards to soft grey border */
+.theme-light .border-accent\/15,
+.theme-light .border-accent\/20,
+.theme-light .border-accent\/25,
+.theme-light .border-accent\/30,
+.theme-light .border-accent\/\[0\.3\],
+.theme-light .border-accent\/\[0\.15\],
+.theme-light .border-accent\/\[0\.08\],
+.theme-light .border-accent\/5 {
+  border-color: rgba(0, 0, 0, 0.15) !important;
+}
+
+/* Text coloring for active accents in lists/tabs */
+.theme-light .text-accent\/80,
+.theme-light .text-accent\/90,
+.theme-light .text-accent\/70 {
+  color: #444444 !important;
+}
+
+/* Eradicate dark gradient shadows designed for dark mode - replace with elegant, soft light shadows */
+.theme-light .shadow-lg,
+.theme-light .shadow-2xl,
+.theme-light .shadow-xl,
+.theme-light .shadow-md,
+.theme-light [class*="shadow-["] {
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.03), 0 1px 3px rgba(0, 0, 0, 0.02) !important;
+}
+
+/* Ensure glass inputs or forms look stellar */
+.theme-light input,
+.theme-light textarea,
+.theme-light select {
+  color: #1C1C1E !important;
+  background-color: #FFFFFF !important;
+  border-color: rgba(0, 0, 0, 0.12) !important;
+}
+.theme-light input::placeholder,
+.theme-light textarea::placeholder {
+  color: #8E8E93 !important;
+}
+
+/* Glass panel bottom dock custom overrides in light theme */
+.theme-light .bg-black\/30 {
+  background-color: rgba(255, 255, 255, 0.7) !important;
+  backdrop-filter: blur(20px);
+}
+.theme-light .bg-white\/\[0\.03\] {
+  background-color: rgba(0, 0, 0, 0.04) !important;
+}
+
+/* ============================================================
+   GLOBAL INPUT & KEYBOARD VIEWPORT STABILIZATION SYSTEM
+   - Prevents auto-zoom on iOS Safari, Android Chrome, and mobile browsers
+   - Ensures inputs render at minimum 16px font-size on mobile/touch screens
+   - Maintains compact, refined visual aesthetics
+   - Prevents viewport jumping or horizontal displacement
+   ============================================================ */
+
+/* Enforce 16px base font size for all text entry elements on touch/mobile to prevent mobile browser auto-zoom */
+@media screen and (max-width: 1024px), (pointer: coarse) {
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]),
+  textarea,
+  select,
+  [contenteditable="true"] {
+    font-size: 16px !important;
+  }
+}
+
+/* Optimize touch interactions and prevent accidental double-tap zoom jumps */
+input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="color"]):not([type="button"]):not([type="submit"]):not([type="reset"]),
+textarea,
+select,
+[contenteditable="true"],
+button,
+a,
+label {
+  touch-action: manipulation;
+}
+
+/* Stabilize root viewport */
+html, body, #root {
+  width: 100%;
+  min-height: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overscroll-behavior-y: none;
+  -webkit-overflow-scrolling: touch;
+}
+
