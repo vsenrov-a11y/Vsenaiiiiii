@@ -1,19 +1,8 @@
 // Web Audio API Sound Synthesizer for Orb Chimes and Rewards
-
-let audioCtx: AudioContext | null = null;
+import { getGlobalAudioContext } from './audioHelper';
 
 const getAudioContext = () => {
-  if (typeof window === 'undefined') return null;
-  if (!audioCtx) {
-    const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-    if (AudioContextClass) {
-      audioCtx = new AudioContextClass();
-    }
-  }
-  if (audioCtx && audioCtx.state === 'suspended') {
-    audioCtx.resume().catch(() => {});
-  }
-  return audioCtx;
+  return getGlobalAudioContext();
 };
 
 export const playOrbEarnSound = () => {

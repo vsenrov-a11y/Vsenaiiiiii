@@ -4,6 +4,7 @@ import { ChatMessage, Persona, StorageConfig, ChatHistory } from '../../types';
 import { PERSONAS } from '../../data/personas';
 import { buildStableSystemInstruction, buildDynamicSystemInstruction } from '../../utils/systemInstructionBuilder';
 import { getRealWorldDefaultCalendar } from '../../utils/calendarHelper';
+import { getValidPreviewMessage, renderCardPreviewText } from '../../utils/cardTextHelper';
 import { resolveWallpaper } from '../../utils/wallpaperResolver';
 import { shouldSkipSceneDetection, detectSceneState } from '../../utils/sceneDetectionClient';
 import { CharacterProfileScreen } from './CharacterProfileScreen';
@@ -12,11 +13,62 @@ import { WorldProfileScreen } from './WorldProfileScreen';
 import { EditMessageModal } from '../EditMessageModal';
 import { OrbBadge } from '../common/OrbBadge';
 import { OrbWalletModal } from '../common/OrbWalletModal';
+import { AdminAudioModal } from '../common/AdminAudioModal';
 import { SafeImage } from '../common/SafeImage';
+import { AudioPlayerBubble } from '../common/AudioPlayerBubble';
 
-import { Send, Play, PlayCircle, Video, ArrowLeft, Smartphone, Activity, Briefcase, ShoppingBag, Shirt, Package, Sparkles, RefreshCw, AlertCircle, User, Image, Smile, ChevronsRight, Copy, GitFork, Pencil, Pin, Flag, X, ChevronDown, Check, CheckCircle2, Calendar, HelpCircle, Lock, Volume2, VolumeX, Palette, ChevronLeft, ChevronRight, Menu, Trash2, Plus, Info, LayoutTemplate, MessageSquareCode, Share2, Eye, Heart, Compass, Globe, Zap, Wand2, Sliders, MessageSquare, MapPin, CloudSun, Users, Award, Save, Clock, Brain, UserCheck, History, Target, BookOpen, Dumbbell, Search } from 'lucide-react';
+import { Send, Play, PlayCircle, Video, ArrowLeft, Smartphone, Activity, Briefcase, ShoppingBag, Shirt, Package, Sparkles, RefreshCw, AlertCircle, User, Image, Smile, ChevronsRight, Copy, GitFork, Pencil, Pin, Flag, X, ChevronDown, Check, CheckCircle2, Calendar, HelpCircle, Lock, Volume2, VolumeX, Palette, ChevronLeft, ChevronRight, Menu, Trash2, Plus, Info, LayoutTemplate, MessageSquareCode, Share2, Eye, Heart, Compass, Globe, Zap, Wand2, Sliders, MessageSquare, MapPin, CloudSun, Users, Award, Save, Clock, Brain, UserCheck, History, Target, BookOpen, Dumbbell, Search, FileAudio } from 'lucide-react';
 import { getAsset, storeAsset, useAsset } from '../../utils/fileDb';
-import { saveCharacterChatToLocalStorage, loadCharacterChatFromLocalStorage, clearCharacterChatFromLocalStorage } from '../../utils/storage';
+import { createOptimizedAudioElement, getPlayableAudioUrl, registerGlobalAudioUnlocker, unlockAudioSystem } from '../../utils/audioHelper';
+import { auth } from '../../lib/firebase';
+import { 
+  saveCharacterChatToLocalStorage, 
+  loadCharacterChatFromLocalStorage, 
+  clearCharacterChatFromLocalStorage,
+  saveSessionDraft,
+  loadSessionDraft,
+  clearSessionDraft,
+  mergeMessageArrays
+} from '../../utils/storage';
+import { 
+  saveSingleChatToCloud, 
+  saveMessageToSubcollection, 
+  loadChatMessagesFromSubcollection, 
+  subscribeToChatMessages,
+  deleteMessageFromSubcollection,
+  createNewSession,
+  sendMessage,
+  updateChatUserPersonaInCloud,
+  saveUserPersonaToChat
+} from '../../utils/cloudSync';
+
+const parseUserMessage = (rawText: string) => {
+  if (!rawText) return { cleanText: '', systemNotes: [] };
+  const systemNotes: string[] = [];
+  const cleanText = rawText.replace(/\[([^\]]+)\]/g, (match, note) => {
+    if (note && note.trim()) {
+      systemNotes.push(note.trim());
+    }
+    return '';
+  }).trim();
+
+  return { cleanText: cleanText || (systemNotes.length > 0 ? `*(${systemNotes[0]})*` : rawText), systemNotes };
+};
+
+const sanitizeChatMessages = (msgs: ChatMessage[]): ChatMessage[] => {
+  if (!Array.isArray(msgs)) return [];
+  return msgs.filter(m => {
+    if (!m || !m.text) return false;
+    const trimmed = m.text.trim();
+    if (trimmed.startsWith('**Error:**') || trimmed.startsWith('Error:') || trimmed.includes('All attempted API Keys') || trimmed.includes('Service temporarily busy')) {
+      return false;
+    }
+    return true;
+  }).map(m => ({
+    ...m,
+    isStreaming: false
+  }));
+};
 
 const fetchWithRetry = async (url: string, options: RequestInit, retries = 2, delayMs = 600): Promise<Response> => {
   for (let attempt = 0; attempt <= retries; attempt++) {
@@ -119,7 +171,7 @@ interface PremiumChatScreenProps {
   historyId: string | null;
   initialMessages?: ChatMessage[];
   onBack: () => void;
-  onSaveHistory: (historyId: string, messages: ChatMessage[], lastMessageText: string, personaId?: string) => void;
+  onSaveHistory: (historyId: string, messages: ChatMessage[], lastMessageText: string, personaId?: string, newDeletedMessageIds?: string[]) => void;
   isRepliesEnabled?: boolean;
   isHapticEnabled?: boolean;
   storageConfig?: StorageConfig;
@@ -129,6 +181,7 @@ interface PremiumChatScreenProps {
   onUpdateConfig?: (config: Partial<StorageConfig>) => void;
   theme?: 'dark' | 'light';
   onEditPersona?: (personaId: string) => void;
+  onEditWorld?: (worldId: string) => void;
 }
 
 const getMessageTimeMs = (id: string): number => {
@@ -187,124 +240,139 @@ interface ParsedSegment {
 }
 
 const parseWorldMessage = (text: string, allCompanions: any[], fallbackCharacterName?: string): ParsedSegment[] => {
-  if (!text) return [];
+  if (!text || typeof text !== 'string') return [];
   const segments: ParsedSegment[] = [];
 
-  const lines = text.split('\n');
-  
-  lines.forEach((line, lineIdx) => {
-    const trimmedLine = line.trim();
-    if (!trimmedLine) return;
-
-    let processedLine = trimmedLine;
-    // Preprocess choice numbering to keep it inside the narration block instead of splitting it out
-    processedLine = processedLine.replace(/^(\d+)\.\s*\*\*([^*]+)\*\*/g, '**$1. $2**');
-    processedLine = processedLine.replace(/^(\d+)\.\s*\*([^*]+)\*/g, '*$1. $2*');
-
-    // Check if the line starts with a speaker prefix: CharacterName: or [CharacterName]:
-    let lineSpeakerName: string | null = null;
-    let lineCompanion: any = null;
-    let restOfLine = processedLine;
-
-    const prefixMatch = processedLine.match(/^(?:\[([A-Za-z0-9_'\s]{1,30})\]|([A-Za-z0-9_'\s]{1,30}))\s*:\s*(.*)$/s);
-    if (prefixMatch) {
-      const candidateName = (prefixMatch[1] || prefixMatch[2] || '').trim();
-      const matched = allCompanions.find(c => 
-        c.name.toLowerCase() === candidateName.toLowerCase() ||
-        c.name.toLowerCase().includes(candidateName.toLowerCase()) ||
-        candidateName.toLowerCase().includes(c.name.toLowerCase())
-      );
-      if (matched || candidateName.length < 25) {
-        lineSpeakerName = matched ? matched.name : candidateName;
-        lineCompanion = matched;
-        restOfLine = prefixMatch[3].trim();
-      }
-    }
-
-    const parts = restOfLine.split(/(\*{1,2}[^*]+\*{1,2}|["“][^"”]*["”])/g).filter(p => p.trim());
-
-    if (parts.length === 0) {
-      if (lineSpeakerName) {
-        segments.push({
-          id: `empty-dialogue-${lineIdx}`,
-          type: 'dialogue',
-          characterName: lineSpeakerName,
-          character: lineCompanion,
-          text: ''
-        });
-      }
-      return;
-    }
+  try {
+    const lines = text.split('\n');
+    const safeCompanions = Array.isArray(allCompanions) ? allCompanions.filter(c => c && typeof c === 'object') : [];
     
-    parts.forEach((part, pIdx) => {
-      const trimmedPart = part.trim();
-      if (!trimmedPart) return;
+    lines.forEach((line, lineIdx) => {
+      const trimmedLine = (line || '').trim();
+      if (!trimmedLine) return;
 
-      const isAction = trimmedPart.startsWith('*') && trimmedPart.endsWith('*');
-      const isDialogueWithQuotes = (trimmedPart.startsWith('"') && trimmedPart.endsWith('"')) || (trimmedPart.startsWith('“') && trimmedPart.endsWith('”'));
-      
-      if (isAction) {
-        const stripped = trimmedPart.replace(/^\*+/, '').replace(/\*+$/, '').trim();
-        segments.push({
-          id: `narration-${lineIdx}-${pIdx}`,
-          type: 'narration',
-          characterName: lineSpeakerName || undefined,
-          character: lineCompanion,
-          text: stripped
+      let processedLine = trimmedLine;
+      // Preprocess choice numbering to keep it inside the narration block instead of splitting it out
+      processedLine = processedLine.replace(/^(\d+)\.\s*\*\*([^*]+)\*\*/g, '**$1. $2**');
+      processedLine = processedLine.replace(/^(\d+)\.\s*\*([^*]+)\*/g, '*$1. $2*');
+
+      // Check if the line starts with a speaker prefix: CharacterName: or [CharacterName]:
+      let lineSpeakerName: string | null = null;
+      let lineCompanion: any = null;
+      let restOfLine = processedLine;
+
+      const prefixMatch = processedLine.match(/^(?:\[([A-Za-z0-9_'\s]{1,30})\]|([A-Za-z0-9_'\s]{1,30}))\s*:\s*(.*)$/s);
+      if (prefixMatch) {
+        const candidateName = (prefixMatch[1] || prefixMatch[2] || '').trim();
+        const candLower = candidateName.toLowerCase();
+        const matched = safeCompanions.find(c => {
+          const cName = (c?.name || '').toLowerCase();
+          return cName && candLower && (cName === candLower || cName.includes(candLower) || candLower.includes(cName));
         });
-      } else if (isDialogueWithQuotes) {
-        const quoteContent = trimmedPart.substring(1, trimmedPart.length - 1).trim();
-        segments.push({
-          id: `dialogue-${lineIdx}-${pIdx}`,
-          type: 'dialogue',
-          characterName: lineSpeakerName || fallbackCharacterName || "Companion",
-          character: lineCompanion || allCompanions.find(c => c.name.toLowerCase() === (lineSpeakerName || fallbackCharacterName || '').toLowerCase()),
-          text: quoteContent
-        });
-      } else {
-        // Plain text without asterisks and without surrounding quotes
-        // Check if there is an embedded speaker tag like: Marcus: "..." or Marcus: Hello
-        const inlinePrefix = trimmedPart.match(/^(?:\[([A-Za-z0-9_'\s]{1,30})\]|([A-Za-z0-9_'\s]{1,30}))\s*:\s*(.*)$/s);
-        if (inlinePrefix) {
-          const inlineName = (inlinePrefix[1] || inlinePrefix[2] || '').trim();
-          const matched = allCompanions.find(c => 
-            c.name.toLowerCase() === inlineName.toLowerCase() ||
-            c.name.toLowerCase().includes(inlineName.toLowerCase()) ||
-            inlineName.toLowerCase().includes(c.name.toLowerCase())
-          );
-          const activeName = matched ? matched.name : inlineName;
-          const inlineText = (inlinePrefix[3] || '').trim();
-          if (inlineText) {
-            segments.push({
-              id: `dialogue-inline-${lineIdx}-${pIdx}`,
-              type: 'dialogue',
-              characterName: activeName,
-              character: matched,
-              text: inlineText.replace(/^["“]/, '').replace(/["”]$/, '')
-            });
-          }
-        } else if (lineSpeakerName) {
-          // Part of a prefixed line -> dialogue
+        if (matched || candidateName.length < 25) {
+          lineSpeakerName = matched ? matched.name : candidateName;
+          lineCompanion = matched;
+          restOfLine = prefixMatch[3].trim();
+        }
+      }
+
+      const parts = restOfLine.split(/(\*{1,2}[^*]+\*{1,2}|["“][^"”]*["”])/g).filter(p => p && p.trim());
+
+      if (parts.length === 0) {
+        if (lineSpeakerName) {
           segments.push({
-            id: `dialogue-plain-${lineIdx}-${pIdx}`,
+            id: `empty-dialogue-${lineIdx}`,
             type: 'dialogue',
             characterName: lineSpeakerName,
             character: lineCompanion,
-            text: trimmedPart
-          });
-        } else {
-          // Unadorned prose with no speaker tag -> 3rd person narration
-          segments.push({
-            id: `narration-plain-${lineIdx}-${pIdx}`,
-            type: 'narration',
-            characterName: undefined,
-            character: undefined,
-            text: trimmedPart
+            text: ''
           });
         }
+        return;
       }
+      
+      parts.forEach((part, pIdx) => {
+        const trimmedPart = part.trim();
+        if (!trimmedPart) return;
+
+        const isAction = trimmedPart.startsWith('*') && trimmedPart.endsWith('*');
+        const isDialogueWithQuotes = (trimmedPart.startsWith('"') && trimmedPart.endsWith('"')) || (trimmedPart.startsWith('“') && trimmedPart.endsWith('”'));
+        
+        if (isAction) {
+          const stripped = trimmedPart.replace(/^\*+/, '').replace(/\*+$/, '').trim();
+          segments.push({
+            id: `narration-${lineIdx}-${pIdx}`,
+            type: 'narration',
+            characterName: lineSpeakerName || undefined,
+            character: lineCompanion,
+            text: stripped
+          });
+        } else if (isDialogueWithQuotes) {
+          const quoteContent = trimmedPart.substring(1, trimmedPart.length - 1).trim();
+          const targetFallback = lineSpeakerName || fallbackCharacterName || "Companion";
+          const targetFallbackLower = targetFallback.toLowerCase();
+          segments.push({
+            id: `dialogue-${lineIdx}-${pIdx}`,
+            type: 'dialogue',
+            characterName: targetFallback,
+            character: lineCompanion || safeCompanions.find(c => {
+              const cName = (c?.name || '').toLowerCase();
+              return cName && (cName === targetFallbackLower);
+            }),
+            text: quoteContent
+          });
+        } else {
+          // Plain text without asterisks and without surrounding quotes
+          // Check if there is an embedded speaker tag like: Marcus: "..." or Marcus: Hello
+          const inlinePrefix = trimmedPart.match(/^(?:\[([A-Za-z0-9_'\s]{1,30})\]|([A-Za-z0-9_'\s]{1,30}))\s*:\s*(.*)$/s);
+          if (inlinePrefix) {
+            const inlineName = (inlinePrefix[1] || inlinePrefix[2] || '').trim();
+            const inlineLower = inlineName.toLowerCase();
+            const matched = safeCompanions.find(c => {
+              const cName = (c?.name || '').toLowerCase();
+              return cName && inlineLower && (cName === inlineLower || cName.includes(inlineLower) || inlineLower.includes(cName));
+            });
+            const activeName = matched ? matched.name : inlineName;
+            const inlineText = (inlinePrefix[3] || '').trim();
+            if (inlineText) {
+              segments.push({
+                id: `dialogue-inline-${lineIdx}-${pIdx}`,
+                type: 'dialogue',
+                characterName: activeName,
+                character: matched,
+                text: inlineText.replace(/^["“]/, '').replace(/["”]$/, '')
+              });
+            }
+          } else if (lineSpeakerName) {
+            // Part of a prefixed line -> dialogue
+            segments.push({
+              id: `dialogue-plain-${lineIdx}-${pIdx}`,
+              type: 'dialogue',
+              characterName: lineSpeakerName,
+              character: lineCompanion,
+              text: trimmedPart
+            });
+          } else {
+            // Unadorned prose with no speaker tag -> 3rd person narration
+            segments.push({
+              id: `narration-plain-${lineIdx}-${pIdx}`,
+              type: 'narration',
+              characterName: undefined,
+              character: undefined,
+              text: trimmedPart
+            });
+          }
+        }
+      });
     });
-  });
+  } catch (parseErr) {
+    console.warn('[parseWorldMessage] Handled parsing fallback:', parseErr);
+    return [{
+      id: `fallback-raw-0`,
+      type: 'narration',
+      text: text
+    }];
+  }
 
   return segments;
 };
@@ -380,14 +448,15 @@ const sanitizeStatusEasyMode = (prevStatus: any = {}, nextStatus: any = {}) => {
   let mood = typeof merged.mood === 'number' ? merged.mood : (parseInt(String(merged.mood)) || 90);
   let arousal = typeof merged.arousal === 'number' ? merged.arousal : (parseInt(String(merged.arousal)) || 10);
 
+  // Status values should stay realistic and resilient: minimum floor of 45-50 ensures user never hits punitive 0-30 burnout or fainting
   return {
     ...merged,
-    health: Math.min(100, Math.max(0, health)),
-    energy: Math.min(100, Math.max(0, energy)),
-    hygiene: Math.min(100, Math.max(0, hygiene)),
-    hunger: Math.min(100, Math.max(0, hunger)),
-    thirst: Math.min(100, Math.max(0, thirst)),
-    mood: Math.min(100, Math.max(0, mood)),
+    health: Math.min(100, Math.max(50, health)),
+    energy: Math.min(100, Math.max(45, energy)),
+    hygiene: Math.min(100, Math.max(40, hygiene)),
+    hunger: Math.min(100, Math.max(40, hunger)),
+    thirst: Math.min(100, Math.max(40, thirst)),
+    mood: Math.min(100, Math.max(40, mood)),
     arousal: Math.min(100, Math.max(0, arousal)),
   };
 };
@@ -623,7 +692,7 @@ const LiveWallpaperLayer: React.FC<LiveWallpaperLayerProps> = React.memo(({ wall
   const containerRef = useRef<HTMLDivElement>(null);
   const [panDistance, setPanDistance] = useState<number>(0);
   const [durationSec, setDurationSec] = useState<number>(65);
-  const [canPan, setCanPan] = useState<boolean>(false);
+  const [isLandscapeWide, setIsLandscapeWide] = useState<boolean>(false);
 
   useEffect(() => {
     if (!wallpaperUrl) return;
@@ -640,23 +709,24 @@ const LiveWallpaperLayer: React.FC<LiveWallpaperLayerProps> = React.memo(({ wall
       const natW = img.naturalWidth || 1920;
       const natH = img.naturalHeight || 1080;
       const imgAspect = natW / natH;
-      const containerAspect = cWidth / cHeight;
 
-      if (imgAspect > containerAspect) {
-        // Landscape image on portrait/narrow container: height fits 100%, width expands naturally
+      // Only allow panning if wallpaper is wide/landscape (aspect > 1.15). Upright, square or portrait wallpapers do not move.
+      const isWide = imgAspect > 1.15;
+      setIsLandscapeWide(isWide);
+
+      if (isWide) {
         const renderedWidth = cHeight * imgAspect;
         const diff = renderedWidth - cWidth;
-        if (diff > 8) {
+        if (diff > 15) {
           setPanDistance(diff);
-          // Scale duration based on travel distance for an ultra-smooth, slow cinematic glide
-          const dynamicDuration = Math.max(50, Math.min(90, 48 + diff / 15));
+          const dynamicDuration = Math.max(50, Math.min(90, 50 + diff / 12));
           setDurationSec(dynamicDuration);
-          setCanPan(true);
-          return;
+        } else {
+          setPanDistance(0);
         }
+      } else {
+        setPanDistance(0);
       }
-      setPanDistance(0);
-      setCanPan(false);
     };
 
     if (img.complete && img.naturalWidth > 0) {
@@ -676,29 +746,29 @@ const LiveWallpaperLayer: React.FC<LiveWallpaperLayerProps> = React.memo(({ wall
     return null;
   }
 
+  const shouldPan = !isPerfMode && isLandscapeWide && panDistance > 0;
+
   return (
     <div 
       ref={containerRef}
       className="absolute inset-0 z-0 overflow-hidden pointer-events-none select-none"
-      style={{
-        containerType: 'inline-size'
-      }}
     >
       <img
         key={wallpaperUrl}
         src={wallpaperUrl}
         alt="World Wallpaper"
-        className={`absolute top-0 bottom-0 h-full w-auto max-w-none min-w-full pointer-events-none select-none ${
-          isPerfMode || !canPan ? 'left-1/2 -translate-x-1/2 object-cover' : 'left-0 animate-liveWallpaperPan'
+        className={`absolute top-0 bottom-0 pointer-events-none select-none ${
+          shouldPan ? 'h-full w-auto max-w-none animate-liveWallpaperPan' : 'inset-0 w-full h-full object-cover object-center'
         }`}
-        style={{
+        style={shouldPan ? {
+          height: '100%',
+          width: 'auto',
+          maxWidth: 'none',
           ['--max-pan' as any]: `-${panDistance}px`,
           ['--pan-duration' as any]: `${durationSec}s`,
-          willChange: isPerfMode || !canPan ? 'auto' : 'transform'
-        }}
+          willChange: 'transform'
+        } : {}}
       />
-      {/* Subtle soft-focus overlay to keep background artwork visible yet non-distracting */}
-      <div className="absolute inset-0 bg-gradient-to-b from-black/55 via-black/25 to-black/80 pointer-events-none" />
     </div>
   );
 });
@@ -737,6 +807,7 @@ interface ChatMessageListProps {
   isStreaming: boolean;
   parsedWorldMessagesCacheRef: React.MutableRefObject<Map<string, any>>;
   lastHistoryIdRef: React.MutableRefObject<string | null | undefined>;
+  onRewindAndSave?: (msgId: string, newText: string) => void;
 }
 
 const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
@@ -745,6 +816,7 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
   handleContainerScroll,
   handleTouchStart,
   handleTouchMove,
+  onRewindAndSave,
   messages,
   linkedWorld,
   isZeroCharactersMode,
@@ -774,6 +846,20 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
   parsedWorldMessagesCacheRef,
   lastHistoryIdRef,
 }) => {
+  const [visibleLimit, setVisibleLimit] = React.useState<number>(65);
+
+  React.useEffect(() => {
+    if (messages.length <= 65) {
+      setVisibleLimit(65);
+    }
+  }, [messages.length]);
+
+  const displayedMessages = messages.length > visibleLimit 
+    ? messages.slice(messages.length - visibleLimit) 
+    : messages;
+
+  const hasMore = messages.length > visibleLimit;
+
   return (
     <div 
       ref={scrollContainerRef} 
@@ -782,13 +868,31 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
       onTouchMove={handleTouchMove}
       onPointerDown={handleTouchStart}
       onPointerMove={handleTouchMove}
-      className="flex-1 p-5 space-y-4 overflow-y-auto flex flex-col"
+      className="flex-1 p-5 space-y-4 overflow-y-auto overflow-x-hidden touch-pan-y flex flex-col"
       style={{ willChange: 'scroll-position', transform: 'translateZ(0)' }}
     >
       {(() => {
         const list: React.ReactNode[] = [];
+        if (hasMore) {
+          list.push(
+            <div key="load-earlier" className="w-full flex items-center justify-center my-3 select-none flex-shrink-0">
+              <button
+                type="button"
+                onClick={() => setVisibleLimit(prev => prev + 50)}
+                className={`px-4 py-1.5 rounded-full text-[10px] font-semibold border transition-all cursor-pointer active:scale-95 ${
+                  isLight 
+                    ? 'bg-black/5 hover:bg-black/10 border-black/10 text-black/70' 
+                    : 'bg-white/5 hover:bg-white/10 border-white/10 text-white/70'
+                }`}
+              >
+                Load earlier messages ({messages.length - visibleLimit} more)
+              </button>
+            </div>
+          );
+        }
+
         let lastTimeMs = 0;
-        messages.forEach((msg, idx) => {
+        displayedMessages.forEach((msg, idx) => {
           const currentTimeMs = getMessageTimeMs(msg.id);
           const showDivider = idx === 0 || (currentTimeMs - lastTimeMs > 86400000);
           if (showDivider) {
@@ -804,7 +908,8 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
           }
           lastTimeMs = currentTimeMs;
 
-          const isUser = msg.role === 'user';
+          const isUser = msg.isUser === true || msg.role === 'user';
+          const displayUserPersonaName = activeUserPersona?.name || currentPersonaName || 'Persona';
           const isMultiCharacterWorld = linkedWorld && !isZeroCharactersMode;
 
           if (msg.isStreaming && (!msg.text || !msg.text.trim())) {
@@ -814,13 +919,13 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
           if (isMultiCharacterWorld) {
             let msgText = msg.text || '';
             if (isUser && !msgText.includes(':') && !msgText.startsWith('*') && !msgText.startsWith('"') && !msgText.startsWith('“')) {
-              msgText = `${currentPersonaName}: ${msgText}`;
+              msgText = `${displayUserPersonaName}: ${msgText}`;
             }
 
             const cacheKey = `${msg.id}_${msgText}_${allCompanions.length}`;
             let segments = parsedWorldMessagesCacheRef.current.get(cacheKey);
             if (!segments) {
-              segments = parseWorldMessage(msgText, allCompanions, isUser ? currentPersonaName : characterName);
+              segments = parseWorldMessage(msgText, allCompanions, isUser ? displayUserPersonaName : characterName);
               if (parsedWorldMessagesCacheRef.current.size > 300) {
                 parsedWorldMessagesCacheRef.current.clear();
               }
@@ -830,17 +935,17 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
             segments.forEach((segment: any, sIdx: number) => {
               const key = `${msg.id}-${segment.id}`;
               const isDialogue = segment.type === 'dialogue';
-              const isUserDialogue = isDialogue && (segment.characterName === currentPersonaName);
+              const isUserDialogue = isUser || (isDialogue && (segment.characterName === displayUserPersonaName || segment.characterName === currentPersonaName));
 
-              let segmentCharName = segment.characterName || (isUser ? currentPersonaName : characterName);
-              let segmentAvatar = segment.character?.avatar || (segment.characterName === characterName ? persona.avatar : (segment.characterName === currentPersonaName ? activeUserPersona?.avatar : null));
-              let segmentEmoji = segment.character?.avatarEmoji || (segment.characterName === characterName ? persona.avatarEmoji : (segment.characterName === currentPersonaName ? '👤' : '👥'));
-              let segmentGradient = segment.character?.avatarGradient || (segment.characterName === characterName ? persona.avatarGradient : (segment.characterName === currentPersonaName ? (activeUserPersona?.avatarGradient || 'from-zinc-500 to-zinc-700') : 'from-indigo-500 to-purple-600'));
+              let segmentCharName = isUserDialogue ? displayUserPersonaName : (segment.characterName || characterName);
+              let segmentAvatar = segment.character?.avatar || (segment.characterName === characterName ? persona?.avatar : (isUserDialogue ? activeUserPersona?.avatar : null));
+              let segmentEmoji = segment.character?.avatarEmoji || (segment.characterName === characterName ? (persona?.avatarEmoji || '🎭') : (isUserDialogue ? '👤' : '👥'));
+              let segmentGradient = segment.character?.avatarGradient || (segment.characterName === characterName ? (persona?.avatarGradient || 'from-indigo-500 to-purple-600') : (isUserDialogue ? (activeUserPersona?.avatarGradient || 'from-zinc-500 to-zinc-700') : 'from-indigo-500 to-purple-600'));
 
               list.push(
                 <div
                   key={key}
-                  className={`flex flex-col relative z-10 ${
+                  className={`flex flex-col relative z-10 touch-pan-y select-none ${
                     !isDialogue
                       ? 'max-w-[95%] w-full self-center items-center px-4 md:px-12'
                       : isUserDialogue
@@ -894,6 +999,11 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                           <SafeImage src={msg.image} alt="Uploaded attachment" className="w-full max-h-60 object-cover rounded-lg" />
                         </div>
                       )}
+                      {msg.audio && sIdx === 0 && (
+                        <div className="mb-2">
+                          <AudioPlayerBubble src={msg.audio} title={msg.audioName || 'Audio Attachment'} theme={isLight ? 'light' : 'dark'} />
+                        </div>
+                      )}
                       <div className="whitespace-pre-wrap break-words font-sans" style={{ fontSize: `${storageConfig?.messageTextSize || 13}px` }}>
                         {editingMessageId === msg.id ? (
                           <InlineMessageEditor
@@ -905,20 +1015,9 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                               triggerToast("Message updated");
                             }}
                             onRewindAndSave={(newText) => {
-                              const edited = messages.map(m => m.id === msg.id ? { ...m, text: newText } : m);
-                              const msgIndex = edited.findIndex(m => m.id === msg.id);
-                              if (msgIndex !== -1) {
-                                const rewinded = edited.slice(0, msgIndex + 1);
-                                setMessages(rewinded);
-                                const targetHistoryId = activeHistoryId || historyId || `chat-${Date.now()}`;
-                                if (!activeHistoryId) setActiveHistoryId(targetHistoryId);
-                                lastHistoryIdRef.current = targetHistoryId;
-                                onSaveHistory(targetHistoryId, rewinded, newText, persona.id);
-                                triggerToast("Rewound conversation & updated message");
-                              } else {
-                                setMessages(edited);
+                              if (onRewindAndSave) {
+                                onRewindAndSave(msg.id, newText);
                               }
-                              setEditingMessageId(null);
                             }}
                           />
                         ) : (
@@ -931,7 +1030,7 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                     {sIdx === segments.length - 1 && !msg.isStreaming && msg.id === messages[messages.length - 1]?.id && (
                       <div className="flex items-center gap-2 mt-1.5 px-1.5 text-[10px] text-white/40">
                         {msg.alternatives && msg.alternatives.length > 1 && (
-                          <div className="flex items-center bg-white/[0.04] border border-white/[0.06] rounded-full p-0.5 gap-1 shadow-inner">
+                          <div className="flex items-center bg-white/[0.08] backdrop-blur-xl border border-white/[0.14] rounded-full p-0.5 gap-1 shadow-sm">
                             {msg.alternatives.map((_, idx) => (
                               <button
                                 key={idx}
@@ -944,10 +1043,10 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                                     activeAlternativeIndex: idx
                                   } : m));
                                 }}
-                                className={`w-4 h-4 rounded-full text-[8.5px] font-mono flex items-center justify-center transition-all cursor-pointer ${
+                                className={`w-4 h-4 rounded-full text-[8.5px] font-mono flex items-center justify-center transition-all cursor-pointer backdrop-blur-md ${
                                   (msg.activeAlternativeIndex || 0) === idx
                                     ? 'bg-white text-black font-bold scale-105 shadow-sm'
-                                    : 'text-white/50 hover:text-white hover:bg-white/[0.05]'
+                                    : 'text-white/60 hover:text-white hover:bg-white/[0.12]'
                                 }`}
                                 title={`Switch to version ${idx + 1}`}
                               >
@@ -962,7 +1061,7 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                             type="button"
                             onClick={() => handleRetryMessage(msg.id)}
                             disabled={isStreaming}
-                            className="flex items-center gap-1 hover:text-white transition-all bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.05] rounded-full px-2.5 py-0.5 active:scale-95 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+                            className="flex items-center gap-1 text-white/80 hover:text-white transition-all bg-white/[0.08] hover:bg-white/[0.16] backdrop-blur-xl border border-white/[0.14] rounded-full px-2.5 py-0.5 active:scale-95 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed shadow-sm"
                             title="Regenerate another response"
                           >
                             <RefreshCw className={`w-2.5 h-2.5 ${isStreaming ? 'animate-spin' : ''}`} />
@@ -978,7 +1077,7 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
             list.push(
               <div
                 key={msg.id}
-                className={`flex flex-col relative z-10 ${
+                className={`flex flex-col relative z-10 touch-pan-y select-none ${
                   isUser
                     ? 'max-w-[85%] sm:max-w-[75%] self-end items-end'
                     : isZeroCharactersMode
@@ -987,21 +1086,21 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                 } ${chatLayout === 'compact' ? 'mb-2.5' : 'mb-4'}`}
               >
                 {!isZeroCharactersMode && (
-                  <div className={`relative z-30 flex items-center gap-2 mb-1.5 h-6 min-h-[24px] flex-shrink-0 ${isUser ? 'flex-row-reverse mr-1' : 'flex-row ml-1'} select-none`}>
+                  <div className={`relative z-30 flex items-center gap-2 mb-1.5 h-6 min-h-[24px] flex-shrink-0 ${isUser ? 'flex-row-reverse mr-1 justify-end' : 'flex-row ml-1 justify-start'} select-none`}>
                     {isUser ? (
                       activeUserPersona?.avatar ? (
                         <SafeImage 
                           src={activeUserPersona.avatar} 
                           referrerPolicy="no-referrer" 
                           className={`w-5 h-5 rounded-[6px] object-cover border select-none shadow-sm relative z-30 ${isLight ? 'border-black/10' : 'border-white/10'}`} 
-                          alt={currentPersonaName}
+                          alt={displayUserPersonaName}
                         />
                       ) : (
                         <div className={`w-5 h-5 rounded-[6px] bg-gradient-to-br ${activeUserPersona?.avatarGradient || 'from-zinc-500 to-zinc-700'} border flex items-center justify-center text-[9px] text-white font-extrabold select-none shadow-sm relative z-30 ${isLight ? 'border-black/10 text-white' : 'border-white/10 text-white/90'}`}>
-                          {currentPersonaName.charAt(0).toUpperCase()}
+                          {displayUserPersonaName.charAt(0).toUpperCase()}
                         </div>
                       )
-                    ) : persona.avatar ? (
+                    ) : persona?.avatar ? (
                       <SafeImage 
                         src={persona.avatar} 
                         referrerPolicy="no-referrer" 
@@ -1009,12 +1108,12 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                         alt={characterName}
                       />
                     ) : (
-                      <div className={`w-5 h-5 rounded-[6px] bg-gradient-to-br ${persona.avatarGradient || 'from-indigo-500 to-purple-600'} border flex items-center justify-center text-[9px] text-white font-extrabold select-none shadow-sm relative z-30 ${isLight ? 'border-black/10 text-white' : 'border-white/10 text-white/90'}`}>
-                        {persona.avatarEmoji || characterName.charAt(0).toUpperCase()}
+                      <div className={`w-5 h-5 rounded-[6px] bg-gradient-to-br ${persona?.avatarGradient || 'from-indigo-500 to-purple-600'} border flex items-center justify-center text-[9px] text-white font-extrabold select-none shadow-sm relative z-30 ${isLight ? 'border-black/10 text-white' : 'border-white/10 text-white/90'}`}>
+                        {persona?.avatarEmoji || characterName.charAt(0).toUpperCase()}
                       </div>
                     )}
                     <span className={`text-[10.5px] font-sans font-bold tracking-wide relative z-30 ${isLight ? 'text-black/80' : 'text-white/95'}`}>
-                      {isUser ? currentPersonaName : characterName}
+                      {isUser ? displayUserPersonaName : characterName}
                     </span>
                   </div>
                 )}
@@ -1045,6 +1144,11 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                       <SafeImage src={msg.image} alt="Uploaded attachment" className="w-full max-h-60 object-cover rounded-lg" />
                     </div>
                   )}
+                  {msg.audio && (
+                    <div className="mb-2">
+                      <AudioPlayerBubble src={msg.audio} title={msg.audioName || 'Audio Attachment'} theme={isLight ? 'light' : 'dark'} />
+                    </div>
+                  )}
                   <div className="whitespace-pre-wrap break-words font-sans" style={{ fontSize: `${storageConfig?.messageTextSize || 13}px` }}>
                     {editingMessageId === msg.id ? (
                       <InlineMessageEditor
@@ -1056,20 +1160,9 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                           triggerToast("Message updated");
                         }}
                         onRewindAndSave={(newText) => {
-                          const edited = messages.map(m => m.id === msg.id ? { ...m, text: newText } : m);
-                          const msgIndex = edited.findIndex(m => m.id === msg.id);
-                          if (msgIndex !== -1) {
-                            const rewinded = edited.slice(0, msgIndex + 1);
-                            setMessages(rewinded);
-                            const targetHistoryId = activeHistoryId || historyId || `chat-${Date.now()}`;
-                            if (!activeHistoryId) setActiveHistoryId(targetHistoryId);
-                            lastHistoryIdRef.current = targetHistoryId;
-                            onSaveHistory(targetHistoryId, rewinded, newText, persona.id);
-                            triggerToast("Rewound conversation & updated message");
-                          } else {
-                            setMessages(edited);
+                          if (onRewindAndSave) {
+                            onRewindAndSave(msg.id, newText);
                           }
-                          setEditingMessageId(null);
                         }}
                       />
                     ) : (
@@ -1117,7 +1210,7 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                 {!isUser && !msg.isStreaming && msg.id === messages[messages.length - 1]?.id && (
                   <div className="flex items-center gap-2 mt-1.5 px-1.5 text-[10px] text-white/40">
                     {msg.alternatives && msg.alternatives.length > 1 && (
-                      <div className="flex items-center bg-white/[0.04] border border-white/[0.06] rounded-full p-0.5 gap-1 shadow-inner">
+                      <div className="flex items-center bg-white/[0.08] backdrop-blur-xl border border-white/[0.14] rounded-full p-0.5 gap-1 shadow-sm">
                         {msg.alternatives.map((_, idx) => (
                           <button
                             key={idx}
@@ -1130,10 +1223,10 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                                 activeAlternativeIndex: idx
                               } : m));
                             }}
-                            className={`w-4 h-4 rounded-full text-[8.5px] font-mono flex items-center justify-center transition-all cursor-pointer ${
+                            className={`w-4 h-4 rounded-full text-[8.5px] font-mono flex items-center justify-center transition-all cursor-pointer backdrop-blur-md ${
                               (msg.activeAlternativeIndex || 0) === idx
                                 ? 'bg-white text-black font-bold scale-105 shadow-sm'
-                                : 'text-white/50 hover:text-white hover:bg-white/[0.05]'
+                                : 'text-white/60 hover:text-white hover:bg-white/[0.12]'
                             }`}
                             title={`Switch to version ${idx + 1}`}
                           >
@@ -1148,7 +1241,7 @@ const ChatMessageList: React.FC<ChatMessageListProps> = React.memo(({
                         type="button"
                         onClick={() => handleRetryMessage(msg.id)}
                         disabled={isStreaming}
-                        className="flex items-center gap-1 hover:text-white transition-all bg-white/[0.03] hover:bg-white/[0.06] border border-white/[0.05] rounded-full px-2.5 py-0.5 active:scale-95 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+                        className="flex items-center gap-1 text-white/80 hover:text-white transition-all bg-white/[0.08] hover:bg-white/[0.16] backdrop-blur-xl border border-white/[0.14] rounded-full px-2.5 py-0.5 active:scale-95 cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed shadow-sm"
                         title="Regenerate another response"
                       >
                         <RefreshCw className={`w-2.5 h-2.5 ${isStreaming ? 'animate-spin' : ''}`} />
@@ -1199,6 +1292,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
   onUpdateConfig,
   theme = 'dark',
   onEditPersona,
+  onEditWorld,
   initialLinkedWorldId,
 }) => {
   if (!persona) return null;
@@ -1206,6 +1300,16 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
 
   // Track active history ID internally (starts with passed prop, can become new generated id)
   const [activeHistoryId, setActiveHistoryId] = useState<string | null>(historyId);
+
+  // Track deleted / tombstoned message IDs so they never reappear
+  const currentSessionObj = (storageConfig?.chatHistories || []).find(h => h.id === (historyId || activeHistoryId));
+  const deletedMessageIdsRef = useRef<Set<string>>(new Set(currentSessionObj?.deletedMessageIds || []));
+  
+  useEffect(() => {
+    if (currentSessionObj?.deletedMessageIds) {
+      currentSessionObj.deletedMessageIds.forEach(id => deletedMessageIdsRef.current.add(id));
+    }
+  }, [currentSessionObj?.deletedMessageIds]);
 
   const [messages, setMessages] = useState<ChatMessage[]>(() => {
     // 1. Initial messages from the selected session in storageConfig is authoritative
@@ -1223,30 +1327,113 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
     return [];
   });
 
-  // Automatically restore chat history from localStorage when character or session changes
+  // Automatically restore chat history from localStorage and Firestore subcollection /chats/{chatId}/messages
   useEffect(() => {
     if (initialMessages && initialMessages.length > 0) {
-      setMessages(initialMessages);
-      return;
+      setMessages(sanitizeChatMessages(initialMessages).filter(m => !deletedMessageIdsRef.current.has(m.id)));
+    } else {
+      const currentId = historyId || activeHistoryId;
+      if (currentId) {
+        const saved = loadCharacterChatFromLocalStorage(currentId);
+        if (saved && saved.length > 0) {
+          setMessages(sanitizeChatMessages(saved).filter(m => !deletedMessageIdsRef.current.has(m.id)));
+        }
+      } else if (persona?.id) {
+        const saved = loadCharacterChatFromLocalStorage(persona.id);
+        if (saved && saved.length > 0) {
+          setMessages(sanitizeChatMessages(saved).filter(m => !deletedMessageIdsRef.current.has(m.id)));
+        }
+      }
     }
+
     const currentId = historyId || activeHistoryId;
-    if (currentId) {
-      const saved = loadCharacterChatFromLocalStorage(currentId);
-      if (saved && saved.length > 0) {
-        setMessages(saved);
-        return;
+    if (!currentId) return;
+
+    // Specifically query the messages subcollection excluding tombstoned IDs
+    loadChatMessagesFromSubcollection(currentId, Array.from(deletedMessageIdsRef.current)).then((cloudMsgs) => {
+      if (cloudMsgs && cloudMsgs.length > 0) {
+        setMessages((prev) => {
+          const merged = mergeMessageArrays(prev, cloudMsgs, Array.from(deletedMessageIdsRef.current));
+          return sanitizeChatMessages(merged);
+        });
       }
-      return;
-    }
-    if (persona?.id && !currentId) {
-      const saved = loadCharacterChatFromLocalStorage(persona.id);
-      if (saved && saved.length > 0) {
-        setMessages(saved);
-        return;
+    }).catch(() => {});
+
+    // Listen for real-time updates of the entire chat history from /chats/{chatId}/messages
+    const unsubscribe = subscribeToChatMessages(
+      currentId, 
+      (cloudMsgs) => {
+        if (cloudMsgs && cloudMsgs.length > 0) {
+          setMessages((prev) => {
+            if (prev.some(m => m.isStreaming)) return prev;
+            const merged = mergeMessageArrays(prev, cloudMsgs, Array.from(deletedMessageIdsRef.current));
+            return sanitizeChatMessages(merged);
+          });
+        }
+      },
+      () => Array.from(deletedMessageIdsRef.current)
+    );
+
+    return () => {
+      unsubscribe();
+    };
+  }, [persona?.id, historyId, activeHistoryId]);
+
+  // Robust handler to irreversibly delete a single message across UI, localStorage, and Firestore
+  const handleDeleteSingleMessage = (messageId: string) => {
+    if (!messageId) return;
+    const targetHistoryId = activeHistoryId || historyId;
+    deletedMessageIdsRef.current.add(messageId);
+
+    setMessages(prev => {
+      const filtered = prev.filter(m => m.id !== messageId);
+      const lastMsg = filtered[filtered.length - 1];
+      const lastText = lastMsg ? (lastMsg.text || '') : '';
+
+      if (targetHistoryId) {
+        saveCharacterChatToLocalStorage(targetHistoryId, filtered, persona?.id);
+        onSaveHistory(targetHistoryId, filtered, lastText, persona?.id, [messageId]);
+        deleteMessageFromSubcollection(targetHistoryId, messageId).catch(() => {});
+      } else if (persona?.id) {
+        saveCharacterChatToLocalStorage(persona.id, filtered);
       }
+      return filtered;
+    });
+
+    setSelectedMessageForMenu(null);
+    triggerToast("Message deleted");
+  };
+
+  // Robust handler to rewind conversation and irreversibly delete downstream messages
+  const handleRewindAndSave = (msgId: string, newText: string) => {
+    const edited = messages.map(m => m.id === msgId ? { ...m, text: newText } : m);
+    const msgIndex = edited.findIndex(m => m.id === msgId);
+    if (msgIndex !== -1) {
+      const rewinded = edited.slice(0, msgIndex + 1);
+      const discardedMsgs = messages.slice(msgIndex + 1);
+      const discardedIds = discardedMsgs.map(m => m.id).filter(Boolean);
+
+      discardedIds.forEach(id => deletedMessageIdsRef.current.add(id));
+      setMessages(rewinded);
+
+      const targetHistoryId = activeHistoryId || historyId || `chat-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      if (!activeHistoryId) setActiveHistoryId(targetHistoryId);
+      lastHistoryIdRef.current = targetHistoryId;
+
+      onSaveHistory(targetHistoryId, rewinded, newText, persona?.id, discardedIds);
+
+      if (targetHistoryId) {
+        saveCharacterChatToLocalStorage(targetHistoryId, rewinded, persona?.id);
+        discardedIds.forEach(id => {
+          deleteMessageFromSubcollection(targetHistoryId, id).catch(() => {});
+        });
+      }
+      triggerToast("Rewound conversation & updated message");
+    } else {
+      setMessages(edited);
     }
-    setMessages([]);
-  }, [persona?.id, historyId]);
+    setEditingMessageId(null);
+  };
 
   // Save the entire conversation to localStorage debounced to avoid UI lag during streaming/typing
   useEffect(() => {
@@ -1268,6 +1455,15 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
   const [externalInputText, setExternalInputText] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (errorMsg) {
+      const t = setTimeout(() => {
+        setErrorMsg(null);
+      }, 3500);
+      return () => clearTimeout(t);
+    }
+  }, [errorMsg]);
   const [showProfile, setShowProfile] = useState(false);
   const [viewedCompanionProfile, setViewedCompanionProfile] = useState<any | null>(null);
   const [showWorldProfile, setShowWorldProfile] = useState(false);
@@ -1281,6 +1477,8 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [selectedImageName, setSelectedImageName] = useState<string | null>(null);
+  const [selectedAudio, setSelectedAudio] = useState<string | null>(null);
+  const [selectedAudioName, setSelectedAudioName] = useState<string | null>(null);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
   const [isPinned, setIsPinned] = useState(false);
 
@@ -1291,10 +1489,14 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
   const [pinnedMessages, setPinnedMessages] = useState<string[]>([]);
   const [activeWallpaper, setActiveWallpaper] = useState<'charcoal' | 'cosmic' | 'aurora' | 'neon'>('charcoal');
   const chatLayout = storageConfig?.chatLayout || 'standard';
-  const [currentPersonaName, setCurrentPersonaName] = useState("Explorer");
+  const defaultUserName = storageConfig?.userPersonas?.find(p => p.id === storageConfig?.activeUserPersonaId)?.name 
+    || storageConfig?.userPersonas?.[0]?.name 
+    || storageConfig?.userProfile?.name 
+    || "You";
+  const [currentPersonaName, setCurrentPersonaName] = useState(defaultUserName);
   const [currentPersonaDesc, setCurrentPersonaDesc] = useState("A curious mind looking for immersive, detailed, and authentic conversations.");
   const [activeBentoSubTab, setActiveBentoSubTab] = useState<'none' | 'memory' | 'chatStyle' | 'persona' | 'history' | 'world'>('none');
-  const [worldTabSection, setWorldTabSection] = useState<'grid' | 'world' | 'character' | 'communication' | 'actions' | 'rp_tools' | 'chat_tools' | 'world_calendar' | 'world_location' | 'world_weather' | 'world_relationships' | 'world_reputation' | 'world_scenes' | 'char_status' | 'char_activity' | 'char_inventory' | 'char_appearance' | 'char_phone'>('grid');
+  const [worldTabSection, setWorldTabSection] = useState<'grid' | 'world' | 'character' | 'communication' | 'actions' | 'rp_tools' | 'chat_tools' | 'world_calendar' | 'world_location' | 'world_weather' | 'world_scenes' | 'char_status' | 'char_activity' | 'char_inventory' | 'char_appearance' | 'char_phone'>('grid');
   const [characterState, setCharacterState] = useState<any>({});
 
   // Maintain a ref to characterState to bypass React closure stale state issues during streaming
@@ -1546,7 +1748,24 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
   const activeSession = targetHistoryId ? (storageConfig?.chatHistories || []).find(h => h.id === targetHistoryId) : null;
   const linkedWorldId = activeSession?.linkedWorldId || initialLinkedWorldId;
   const enableSceneDetection = activeSession?.enableSceneDetection ?? true;
-  const rawLinkedWorld = linkedWorldId ? (storageConfig?.worlds || []).find(w => w.id === linkedWorldId) : null;
+  const rawLinkedWorld = useMemo(() => {
+    if (linkedWorldId) {
+      const found = (storageConfig?.worlds || []).find(w => w.id === linkedWorldId);
+      if (found) return found;
+    }
+    if (persona?.id) {
+      if (persona.id.startsWith('world-')) {
+        const wId = persona.id.replace('world-', '');
+        const found = (storageConfig?.worlds || []).find(w => w.id === wId);
+        if (found) return found;
+      }
+      const worldWithChar = (storageConfig?.worlds || []).find(
+        w => Array.isArray(w.linkedCharacterIds) && w.linkedCharacterIds.includes(persona.id)
+      );
+      if (worldWithChar) return worldWithChar;
+    }
+    return null;
+  }, [linkedWorldId, persona?.id, storageConfig?.worlds]);
 
   // Session-specific linked characters override
   const sessionLinkedCharIds = useMemo(() => {
@@ -1663,10 +1882,29 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
   }, [persona, linkedWorld, storageConfig?.characters]);
 
   const activeUserPersona = React.useMemo(() => {
-    if (!storageConfig?.userPersonas) return null;
-    const upid = activeSession && 'userPersonaId' in activeSession ? (activeSession as any).userPersonaId : storageConfig.activeUserPersonaId;
-    return storageConfig.userPersonas.find(p => p.id === upid) || null;
-  }, [storageConfig?.userPersonas, activeSession, storageConfig?.activeUserPersonaId]);
+    const upid = activeSession && 'userPersonaId' in activeSession ? (activeSession as any).userPersonaId : storageConfig?.activeUserPersonaId;
+    if (upid && storageConfig?.userPersonas) {
+      const found = storageConfig.userPersonas.find(p => p.id === upid);
+      if (found) return found;
+    }
+    if (activeSession && ((activeSession as any).userPersonaName || (activeSession as any).userPersonaAvatar)) {
+      return {
+        id: (activeSession as any).userPersonaId || 'session-persona',
+        name: (activeSession as any).userPersonaName || currentPersonaName,
+        avatar: (activeSession as any).userPersonaAvatar,
+        avatarGradient: 'from-zinc-500 to-zinc-700',
+        description: (activeSession as any).userPersonaDesc || ''
+      };
+    }
+    if (storageConfig?.activeUserPersonaId && storageConfig?.userPersonas) {
+      const found = storageConfig.userPersonas.find(p => p.id === storageConfig.activeUserPersonaId);
+      if (found) return found;
+    }
+    if (storageConfig?.userPersonas && storageConfig.userPersonas.length > 0) {
+      return storageConfig.userPersonas[0];
+    }
+    return null;
+  }, [storageConfig?.userPersonas, activeSession, storageConfig?.activeUserPersonaId, currentPersonaName]);
 
   // Trigger haptic feedback
   const triggerHaptic = React.useCallback(() => {
@@ -1727,17 +1965,18 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
   useEffect(() => {
     if (typeof window !== 'undefined') {
       if (!audio1Ref.current) {
-        audio1Ref.current = new Audio();
+        audio1Ref.current = createOptimizedAudioElement();
         audio1Ref.current.onerror = (e) => {
           console.warn("Audio 1 loading/playback error:", e);
         };
       }
       if (!audio2Ref.current) {
-        audio2Ref.current = new Audio();
+        audio2Ref.current = createOptimizedAudioElement();
         audio2Ref.current.onerror = (e) => {
           console.warn("Audio 2 loading/playback error:", e);
         };
       }
+      unlockAudioSystem([audio1Ref.current, audio2Ref.current]);
     }
   }, []);
 
@@ -1753,24 +1992,52 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
     }
   }, [activePlaceName]);
 
-  const currentPlace = linkedWorld?.places?.find(p => p.name.toLowerCase() === activePlaceName.toLowerCase()) || 
-                       (activePlaceName.toLowerCase() === 'general' ? undefined : linkedWorld?.places?.[0]);
+  const currentPlace = (linkedWorld?.places || []).find(p => (p?.name || '').toLowerCase() === (activePlaceName || '').toLowerCase()) || 
+                       ((activePlaceName || '').toLowerCase() === 'general' ? undefined : linkedWorld?.places?.[0]);
 
-  const activeAmbientSound = linkedWorld?.ambientSounds?.find(s => s.name.toLowerCase() === activeAmbientName.toLowerCase()) ||
-                             (activeAmbientName.toLowerCase() === 'general' ? undefined : linkedWorld?.ambientSounds?.[0]);
+  const activeAmbientSound = useMemo(() => {
+    if (!linkedWorld || !Array.isArray(linkedWorld.ambientSounds) || linkedWorld.ambientSounds.length === 0) {
+      return null;
+    }
+    const hasMedia = (s: any) => s && ((s.videoFile && s.videoFile.trim().length > 0) || (s.audioFile && s.audioFile.trim().length > 0));
+
+    // 1. Try matching active ambient name
+    const exact = linkedWorld.ambientSounds.find(
+      s => hasMedia(s) && (s.name || '').toLowerCase() === (activeAmbientName || '').toLowerCase()
+    );
+    if (exact) return exact;
+
+    // 2. Try 'General'
+    const generalWithMedia = linkedWorld.ambientSounds.find(
+      s => hasMedia(s) && (s.name || '').toLowerCase() === 'general'
+    );
+    if (generalWithMedia) return generalWithMedia;
+
+    // 3. Fallback to first track with media
+    const firstWithMedia = linkedWorld.ambientSounds.find(
+      s => hasMedia(s)
+    );
+    if (firstWithMedia) return firstWithMedia;
+
+    return null;
+  }, [linkedWorld?.ambientSounds, activeAmbientName]);
+
+  const activeAmbientVideoRaw = activeAmbientSound?.videoFile || activeAmbientSound?.audioFile;
+  const activeAmbientVideoUrl = useAsset(activeAmbientVideoRaw);
 
   const resolveWorldPlace = (rawPlace: string | null | undefined): string => {
-    if (!rawPlace || rawPlace === 'no_change' || rawPlace === 'General') return 'General';
-    if (!linkedWorld || !linkedWorld.places || linkedWorld.places.length === 0) return rawPlace;
+    if (!rawPlace || rawPlace === 'no_change' || rawPlace.toLowerCase() === 'general') return 'General';
+    if (!linkedWorld || !Array.isArray(linkedWorld.places) || linkedWorld.places.length === 0) return rawPlace;
     const q = rawPlace.toLowerCase().trim();
     // 1. Exact match
-    const exact = linkedWorld.places.find((p: any) => p.name.toLowerCase().trim() === q);
-    if (exact) return exact.name;
+    const exact = linkedWorld.places.find((p: any) => (p?.name || '').toLowerCase().trim() === q);
+    if (exact && exact.name) return exact.name;
     // 2. Partial match
-    const partial = linkedWorld.places.find((p: any) => 
-      p.name.toLowerCase().includes(q) || (q.length > 2 && q.includes(p.name.toLowerCase()))
-    );
-    if (partial) return partial.name;
+    const partial = linkedWorld.places.find((p: any) => {
+      const pNameLower = (p?.name || '').toLowerCase();
+      return pNameLower && (pNameLower.includes(q) || (q.length > 2 && q.includes(pNameLower)));
+    });
+    if (partial && partial.name) return partial.name;
     return rawPlace;
   };
 
@@ -1860,16 +2127,49 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
     reader.readAsDataURL(file);
   };
 
+  // Global user interaction audio unlocker to bypass strict iOS Safari / WebKit autoplay policies
+  useEffect(() => {
+    const cleanupUnlocker = registerGlobalAudioUnlocker(() => [audio1Ref.current, audio2Ref.current]);
+    return cleanupUnlocker;
+  }, []);
+
+  const tryResumeAudioPlayback = useCallback(() => {
+    if (isAmbientMuted) return;
+    unlockAudioSystem([audio1Ref.current, audio2Ref.current]);
+    const currentActive = activeAudioSelectorRef.current === 1 ? audio1Ref.current : audio2Ref.current;
+    if (currentActive && currentActive.src && currentActive.paused) {
+      currentActive.play().catch(() => {});
+    }
+  }, [isAmbientMuted]);
+
+  useEffect(() => {
+    const handleGesture = () => {
+      tryResumeAudioPlayback();
+    };
+
+    window.addEventListener('click', handleGesture, { capture: true, passive: true });
+    window.addEventListener('touchstart', handleGesture, { capture: true, passive: true });
+    window.addEventListener('pointerdown', handleGesture, { capture: true, passive: true });
+    window.addEventListener('keydown', handleGesture, { capture: true, passive: true });
+
+    return () => {
+      window.removeEventListener('click', handleGesture, { capture: true });
+      window.removeEventListener('touchstart', handleGesture, { capture: true });
+      window.removeEventListener('pointerdown', handleGesture, { capture: true });
+      window.removeEventListener('keydown', handleGesture, { capture: true });
+    };
+  }, [tryResumeAudioPlayback]);
+
   // Ambient loop Crossfade Effect
   useEffect(() => {
     const rawTargetSrc = (!isAmbientMuted && activeAmbientSound?.audioFile) 
       ? (activeAmbientSound.audioFile || null) 
       : null;
 
-    const fadeTimeMs = 1500; // 1.5s crossfade
+    const fadeTimeMs = 1200; // 1.2s crossfade
     const intervalMs = 50;
     const steps = fadeTimeMs / intervalMs;
-    const targetMaxVolume = 0.25;
+    const targetMaxVolume = 0.28;
 
     if (fadeIntervalRef.current) {
       clearInterval(fadeIntervalRef.current);
@@ -1882,6 +2182,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
 
     if (!rawTargetSrc) {
       if (activeAudio) {
+        (activeAudio as any).__shouldBePlaying = false;
         let currentStep = 0;
         const initialVol = activeAudio.volume;
         fadeIntervalRef.current = setInterval(() => {
@@ -1898,76 +2199,64 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
           }
         }, intervalMs);
       }
+      if (inactiveAudio) {
+        (inactiveAudio as any).__shouldBePlaying = false;
+      }
       return;
     }
 
     const applyAudio = async () => {
-      const targetAudioSrc = await getAsset(rawTargetSrc);
-      if (!targetAudioSrc || targetAudioSrc.startsWith('db:')) return;
+      const rawAsset = await getAsset(rawTargetSrc);
+      if (!rawAsset || rawAsset.startsWith('db:')) return;
+      const targetAudioSrc = getPlayableAudioUrl(rawAsset);
+      if (!targetAudioSrc) return;
       
-      // If src changed while we were waiting for getAsset, abort
       const updatedRawTargetSrc = (!isAmbientMuted && activeAmbientSound?.audioFile) 
         ? (activeAmbientSound.audioFile || null) 
         : null;
       if (rawTargetSrc !== updatedRawTargetSrc) return;
 
-      if (activeAudio && activeAudio.src === targetAudioSrc) {
-        if (activeAudio.paused) {
-          activeAudio.play().catch(e => {
-            if (e.name !== 'AbortError') console.log("Ambient autoplay blocked:", e);
-          });
+      // If active audio is already playing this exact track
+      if (activeAudio && (activeAudio.src === targetAudioSrc || activeAudio.src.endsWith(targetAudioSrc))) {
+        (activeAudio as any).__shouldBePlaying = !isAmbientMuted;
+        if (activeAudio.paused && !isAmbientMuted) {
+          activeAudio.play().catch(() => {});
         }
-        let currentStep = 0;
-        const initialVol = activeAudio.volume;
-        fadeIntervalRef.current = setInterval(() => {
-          currentStep++;
-          const ratio = currentStep / steps;
-          activeAudio.volume = initialVol + (targetMaxVolume - initialVol) * ratio;
-          if (currentStep >= steps) {
-            activeAudio.volume = targetMaxVolume;
-            if (fadeIntervalRef.current) {
-              clearInterval(fadeIntervalRef.current);
-              fadeIntervalRef.current = null;
-            }
-          }
-        }, intervalMs);
+        activeAudio.volume = targetMaxVolume;
         return;
       }
   
       if (inactiveAudio) {
+        (inactiveAudio as any).__shouldBePlaying = true;
         inactiveAudio.src = targetAudioSrc;
         inactiveAudio.loop = true;
-        inactiveAudio.volume = 0;
+        inactiveAudio.volume = targetMaxVolume;
+        
         inactiveAudio.play().then(() => {
-          let currentStep = 0;
-          const startActiveVol = activeAudio ? activeAudio.volume : 0;
-          
-          fadeIntervalRef.current = setInterval(() => {
-            currentStep++;
-            const ratio = currentStep / steps;
-            inactiveAudio.volume = targetMaxVolume * ratio;
-            if (activeAudio) {
+          if (activeAudio) {
+            (activeAudio as any).__shouldBePlaying = false;
+            let currentStep = 0;
+            const startActiveVol = activeAudio.volume;
+            fadeIntervalRef.current = setInterval(() => {
+              currentStep++;
+              const ratio = currentStep / steps;
               activeAudio.volume = Math.max(0, startActiveVol * (1 - ratio));
-            }
-            
-            if (currentStep >= steps) {
-              inactiveAudio.volume = targetMaxVolume;
-              if (activeAudio) {
+              if (currentStep >= steps) {
                 activeAudio.pause();
                 activeAudio.src = '';
+                if (fadeIntervalRef.current) {
+                  clearInterval(fadeIntervalRef.current);
+                  fadeIntervalRef.current = null;
+                }
               }
-              activeAudioSelectorRef.current = currentActiveSelector === 1 ? 2 : 1;
-              
-              if (fadeIntervalRef.current) {
-                clearInterval(fadeIntervalRef.current);
-                fadeIntervalRef.current = null;
-              }
-            }
-          }, intervalMs);
-        }).catch(err => {
-          if (err.name !== 'AbortError') {
-            console.error("Failed to start crossfading audio:", err);
+            }, intervalMs);
           }
+          activeAudioSelectorRef.current = currentActiveSelector === 1 ? 2 : 1;
+        }).catch((err) => {
+          // Browser autoplay blocked initial play() without gesture - keep element armed!
+          console.warn("Audio autoplay initial play blocked on mobile (waiting for touch gesture):", err);
+          inactiveAudio.volume = targetMaxVolume;
+          activeAudioSelectorRef.current = currentActiveSelector === 1 ? 2 : 1;
         });
       }
     };
@@ -1994,6 +2283,19 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
 
   const handleToggleMute = () => {
     const nextMuted = !isAmbientMuted;
+
+    // DIRECT user interaction trigger: immediately resume or pause in click handler
+    if (!nextMuted) {
+      unlockAudioSystem([audio1Ref.current, audio2Ref.current]);
+      const activeAudio = activeAudioSelectorRef.current === 1 ? audio1Ref.current : audio2Ref.current;
+      if (activeAudio && activeAudio.src) {
+        activeAudio.play().catch(() => {});
+      }
+    } else {
+      if (audio1Ref.current) audio1Ref.current.pause();
+      if (audio2Ref.current) audio2Ref.current.pause();
+    }
+
     if (onUpdateConfig && storageConfig) {
       const { targetId, histories, session } = ensureSessionAndGetId();
       const updatedSession: ChatHistory = {
@@ -2009,7 +2311,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         updatedHistories = [updatedSession, ...histories];
       }
       onUpdateConfig({ chatHistories: updatedHistories });
-      triggerToast(nextMuted ? "Ambient sound muted" : "Ambient sound unmuted");
+      triggerToast(nextMuted ? "Ambient sound muted" : "Ambient sound playing");
     }
   };
 
@@ -2037,12 +2339,13 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
   };
 
   const handleManualAmbientOverride = (ambientName: string) => {
-    // Attempt to unlock audio elements in the same tick as the user click
-    if (audio1Ref.current && audio1Ref.current.paused && audio1Ref.current.src) {
-        audio1Ref.current.play().catch(() => {});
+    // DIRECT user interaction trigger: unlock and play audio in click handler
+    unlockAudioSystem([audio1Ref.current, audio2Ref.current]);
+    if (audio1Ref.current && audio1Ref.current.src) {
+      audio1Ref.current.play().catch(() => {});
     }
-    if (audio2Ref.current && audio2Ref.current.paused && audio2Ref.current.src) {
-        audio2Ref.current.play().catch(() => {});
+    if (audio2Ref.current && audio2Ref.current.src) {
+      audio2Ref.current.play().catch(() => {});
     }
 
     if (onUpdateConfig && storageConfig) {
@@ -2332,9 +2635,6 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         worldCalendarInput,
         worldLocationInput,
         worldWeatherInput,
-        worldReputationInput,
-        charRelScores,
-        getInitialCharScores,
         worldChars,
         apiKey,
         storageConfig,
@@ -2353,9 +2653,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
       let nextCalendar = worldCalendarInput;
       let nextLocation = worldLocationInput;
       let nextWeather = worldWeatherInput;
-      let nextReputation = worldReputationInput;
       let nextSceneMood = worldSceneMood;
-      let nextRelScores = { ...charRelScores };
 
       // 1. Calendar
       if (data.calendar && data.calendar !== 'no_change') {
@@ -2375,67 +2673,24 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         setWorldWeatherInput(data.weather);
       }
 
-      // 4. Reputation
-      if (data.reputation && data.reputation !== 'no_change') {
-        nextReputation = data.reputation;
-        setWorldReputationInput(data.reputation);
-        triggerToast(`World standing: ${data.reputation}`);
-      }
-
-      // 5. Scene Mood
+      // 4. Scene Mood
       if (data.sceneMood && data.sceneMood !== 'no_change') {
         nextSceneMood = data.sceneMood;
         setWorldSceneMood(data.sceneMood);
       }
 
-      // 5. Relationships
-      if (data.relationships && typeof data.relationships === 'object') {
-        let activeTargetId = data.targetCharacterId;
-        let activeTargetName = data.targetCharacterName;
-
-        if (!activeTargetId && activeTargetName) {
-          const matched = worldChars.find(c => c.name.toLowerCase() === activeTargetName.toLowerCase());
-          if (matched) activeTargetId = matched.id;
-        }
-
-        if (!activeTargetId) {
-          activeTargetId = defaultTargetCharId;
-          activeTargetName = defaultTargetCharName;
-        } else if (!activeTargetName) {
-          const matched = worldChars.find(c => c.id === activeTargetId);
-          if (matched) activeTargetName = matched.name;
-        }
-
-        const existing = charRelScores[activeTargetId] || getInitialCharScores(activeTargetId, activeTargetName || 'Companion');
-        const updated = { ...existing };
-        let changed = false;
-
-        Object.keys(data.relationships).forEach(k => {
-          const val = data.relationships[k];
-          if (typeof val === 'number' && val >= 1 && val <= 10 && val !== (existing as any)[k]) {
-            (updated as any)[k] = val;
-            changed = true;
-          }
-        });
-
-        if (changed) {
-          nextRelScores = { ...nextRelScores, [activeTargetId]: updated };
-          setCharRelScores(nextRelScores);
-
-          const displayName = activeTargetName || 'Companion';
-          if (updated.anger >= 7 && existing.anger < 7) {
-            triggerToast(`⚠️ ${displayName} is now Angry (${updated.anger}/10)!`);
-          } else if (updated.respect < existing.respect) {
-            triggerToast(`⚠️ ${displayName}'s respect dropped to ${updated.respect}/10`);
-          } else if (updated.respect > existing.respect) {
-            triggerToast(`✨ ${displayName}'s respect increased to ${updated.respect}/10`);
-          } else {
-            triggerToast(`Relationship with ${displayName} updated`);
-          }
+      // 5. Episodic Memory Extraction
+      let nextMemories = [...storyMemories];
+      if (data.keyMemory && typeof data.keyMemory === 'string' && data.keyMemory !== 'none' && data.keyMemory !== 'no_change') {
+        const memText = data.keyMemory.trim();
+        if (memText && !nextMemories.includes(memText)) {
+          nextMemories = [...nextMemories, memText].slice(-30);
+          setStoryMemories(nextMemories);
+          triggerToast(`🧠 Memory saved: "${memText.length > 32 ? memText.substring(0, 32) + '...' : memText}"`);
         }
       }
 
-      // 6. Save back to session history & update places
+      // 7. Save back to session history & update places
       let nextState = { ...characterState };
       if (data.characterState && typeof data.characterState === 'object') {
         const resState = data.characterState;
@@ -2508,10 +2763,9 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
           worldCalendar: nextCalendar,
           worldLocation: nextLocation,
           worldWeather: nextWeather,
-          worldReputation: nextReputation,
           worldSceneMood: nextSceneMood,
-          relationshipScores: nextRelScores,
           characterState: nextState,
+          storyMemories: nextMemories,
           updatedAt: Date.now(),
         };
 
@@ -2576,8 +2830,15 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
 
   // Sync current user persona details dynamically from the storageConfig
   useEffect(() => {
-    if (targetHistoryId && storageConfig) {
-      const activeSession = (storageConfig?.chatHistories || []).find(h => h.id === targetHistoryId);
+    if (storageConfig) {
+      const activeSession = targetHistoryId ? (storageConfig?.chatHistories || []).find(h => h.id === targetHistoryId) : null;
+      if (activeSession && (activeSession as any).userPersonaName) {
+        setCurrentPersonaName((activeSession as any).userPersonaName);
+        if ((activeSession as any).userPersonaDesc) {
+          setCurrentPersonaDesc((activeSession as any).userPersonaDesc);
+        }
+        return;
+      }
       if (activeSession && 'userPersonaId' in activeSession) {
         const upid = (activeSession as any).userPersonaId;
         if (upid) {
@@ -2596,11 +2857,41 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         if (activePersona) {
           setCurrentPersonaName(activePersona.name);
           setCurrentPersonaDesc(activePersona.description);
+          if (targetHistoryId) {
+            saveUserPersonaToChat(targetHistoryId, {
+              id: activePersona.id,
+              name: activePersona.name,
+              avatar: activePersona.avatar,
+              description: activePersona.description
+            }).catch(() => {});
+          }
           return;
         }
       }
+
+      // Fallback to first user persona
+      if (storageConfig.userPersonas && storageConfig.userPersonas.length > 0) {
+        const firstPersona = storageConfig.userPersonas[0];
+        setCurrentPersonaName(firstPersona.name);
+        setCurrentPersonaDesc(firstPersona.description);
+        if (targetHistoryId) {
+          saveUserPersonaToChat(targetHistoryId, {
+            id: firstPersona.id,
+            name: firstPersona.name,
+            avatar: firstPersona.avatar,
+            description: firstPersona.description
+          }).catch(() => {});
+        }
+        return;
+      }
+
+      // Fallback to userProfile name
+      if (storageConfig.userProfile?.name) {
+        setCurrentPersonaName(storageConfig.userProfile.name);
+        return;
+      }
     }
-  }, [targetHistoryId, storageConfig?.activeUserPersonaId, storageConfig?.userPersonas]);
+  }, [targetHistoryId, storageConfig?.activeUserPersonaId, storageConfig?.userPersonas, storageConfig?.userProfile?.name, storageConfig?.chatHistories]);
 
   // Hydrate persistent world info and relationship scores from activeSession on mount or session change
   useEffect(() => {
@@ -2658,7 +2949,10 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         setCharRelScores(activeSession.relationshipScores as any);
       }
       if (activeSession.characterState) {
-        setCharacterState(activeSession.characterState);
+        setCharacterState({
+          ...activeSession.characterState,
+          status: sanitizeStatusEasyMode(activeSession.characterState.status, {})
+        });
       }
 
       if (activeSession.activeChatStyle) {
@@ -2754,6 +3048,14 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
     }
   }, [triggerToast]);
 
+  const handleSelectRealAudio = React.useCallback((base64Data: string | null, fileName?: string) => {
+    setSelectedAudio(base64Data);
+    setSelectedAudioName(fileName || null);
+    if (base64Data) {
+      triggerToast("Audio attached successfully");
+    }
+  }, [triggerToast]);
+
   const handleExternalTextConsumed = React.useCallback(() => {
     setExternalInputText('');
   }, []);
@@ -2802,7 +3104,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
     return () => {
       if (messagesRef.current && messagesRef.current.length > 0 && lastHistoryIdRef.current) {
         const lastMsgText = messagesRef.current[messagesRef.current.length - 1]?.text || '';
-        onSaveHistory(lastHistoryIdRef.current, messagesRef.current, lastMsgText, persona.id);
+        onSaveHistory(lastHistoryIdRef.current, messagesRef.current, lastMsgText, persona?.id);
       }
     };
   }, []);
@@ -2813,8 +3115,8 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
       hasInitializedRef.current = true;
       lastHistoryIdRef.current = historyId;
       setActiveHistoryId(historyId);
-      setCharacterName(persona.name || '');
-      setCharacterSubtitle(persona.subtitle || '');
+      setCharacterName(persona?.name || '');
+      setCharacterSubtitle(persona?.subtitle || '');
       
       const existingSession = historyId
         ? (storageConfig?.chatHistories || []).find(h => h.id === historyId)
@@ -2832,7 +3134,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                   {
                     id: 'welcome-msg',
                     role: 'ai',
-                    text: `Greetings. I am your **${persona.name}** companion.\n\n${persona.description}\n\nHow may I assist your exploration today?`,
+                    text: `Greetings. I am your **${persona?.name || 'Companion'}** companion.\n\n${persona?.description || 'Ready to explore with you.'}\n\nHow may I assist your exploration today?`,
                     timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }),
                   },
                 ];
@@ -3062,7 +3364,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
     }
 
     // 2. Trigger an immediate active companion DM in the phone Messaging app after 3.5 seconds
-    const activePersona = PERSONAS.find(p => p.id === characterName) || (storageConfig?.characters || []).find(c => c.id === characterName) || PERSONAS[0];
+    const activePersona = PERSONAS.find(p => p.id === characterName) || (storageConfig?.characters || []).find(c => c.id === characterName) || (storageConfig?.characters || [])[0] || persona;
     if (activePersona) {
       setTimeout(async () => {
         try {
@@ -3173,7 +3475,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         setActiveHistoryId(targetHistoryId);
       }
       lastHistoryIdRef.current = targetHistoryId;
-      onSaveHistory(targetHistoryId, newMessages, newMessages[newMessages.length - 1]?.text || '', persona.id);
+      onSaveHistory(targetHistoryId, newMessages, newMessages[newMessages.length - 1]?.text || '', persona?.id);
       triggerToast("Rewound conversation to here");
     }
     setSelectedMessageForMenu(null);
@@ -3225,6 +3527,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
           message: lastUserMsg.text,
           history: sliceHistoryByMemory(historyUpToThis.slice(0, -1)),
           systemInstruction: fullSystemInstruction,
+          selectedModel: storageConfig?.selectedModel || 'gemini-3.1-flash-lite',
           customApiKey: apiKey,
           customApiKeys: storageConfig?.apiKeys,
           customApiProvider: storageConfig?.apiProvider || 'gemini',
@@ -3343,7 +3646,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
       });
 
       setMessages(finalized);
-      onSaveHistory(targetHistoryId, finalized, accumulatedText);
+      onSaveHistory(targetHistoryId, finalized, accumulatedText, persona?.id, Array.from(deletedMessageIdsRef.current));
 
       // Save regenerated AI reply to phone thread if user sent a text message
       if (lastUserMsg.text.includes('*[Sent a text message to') || lastUserMsg.text.includes('on phone]:')) {
@@ -3398,11 +3701,11 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
       setMessages(prev => prev.map(m => {
         if (m.id === msgId) {
           const updatedAltArray = [...(m.alternatives || [])];
-          const errorText = accumulatedText || `**Error:** Failed to regenerate. ${err.message || ''}`;
-          updatedAltArray[newAltIndex] = errorText;
+          const fallbackText = accumulatedText.trim() ? accumulatedText : "*(Unable to regenerate at this moment. Tap Retry to try again.)*";
+          updatedAltArray[newAltIndex] = fallbackText;
           return {
             ...m,
-            text: errorText,
+            text: fallbackText,
             isStreaming: false,
             alternatives: updatedAltArray,
             activeAlternativeIndex: newAltIndex
@@ -3514,16 +3817,37 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
       }
     }
 
+    let finalAudioUrl: string | undefined = undefined;
+    if (selectedAudio) {
+      if (selectedAudio.startsWith('data:')) {
+        try {
+          const assetId = `aud-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+          finalAudioUrl = await storeAsset(assetId, selectedAudio);
+        } catch (err) {
+          console.error("Failed to store audio attachment to IndexedDB", err);
+          finalAudioUrl = selectedAudio;
+        }
+      } else {
+        finalAudioUrl = selectedAudio;
+      }
+    }
+
+    const { cleanText: chatCleanText, systemNotes } = parseUserMessage(userMsgText);
+
     const userMsg: ChatMessage = {
       id: `user-${Date.now()}`,
       role: 'user',
-      text: userMsgText,
+      text: chatCleanText,
       timestamp: timestampStr,
       image: finalAttachmentUrl,
+      audio: finalAudioUrl,
+      audioName: selectedAudioName || undefined,
     };
 
     setSelectedImage(null);
     setSelectedImageName(null);
+    setSelectedAudio(null);
+    setSelectedAudioName(null);
 
     const aiMsgId = `ai-${Date.now()}`;
     const initialAiMsg: ChatMessage = {
@@ -3534,29 +3858,41 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
       isStreaming: true,
     };
 
-    const updatedHistory = [...messages, userMsg];
+    const updatedHistory = [...messages.filter(m => !deletedMessageIdsRef.current.has(m.id)), userMsg];
     setMessages([...updatedHistory, initialAiMsg]);
     setIsStreaming(true);
     setErrorMsg(null);
 
-    const targetHistoryId = activeHistoryId || historyId || `chat-${Date.now()}`;
+    const targetHistoryId = activeHistoryId || historyId || `chat-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
     if (!activeHistoryId) {
       setActiveHistoryId(targetHistoryId);
+      const user = auth.currentUser;
+      if (user && user.uid) {
+        createNewSession(user.uid, persona?.id || 'companion', persona?.name || 'Companion', {
+          id: targetHistoryId,
+          avatarGradient: persona?.avatarGradient,
+          linkedWorldId: persona?.id?.startsWith('world-') ? persona.id.replace('world-', '') : undefined
+        }).catch(() => {});
+      }
     }
     lastHistoryIdRef.current = targetHistoryId;
 
     // Sync to parent history debounced to avoid re-render storm
     const syncHistory = (msgs: ChatMessage[], lastText: string) => {
-      onSaveHistory(targetHistoryId, msgs, lastText, persona.id);
+      onSaveHistory(targetHistoryId, msgs, lastText, persona?.id, Array.from(deletedMessageIdsRef.current));
     };
 
-    // Save user message immediately to persistent storage
+    // Save user message immediately to persistent storage and Firestore subcollection
     syncHistory(updatedHistory, userMsgText);
+    sendMessage(targetHistoryId, auth.currentUser?.uid || 'user', userMsgText, userMsg).catch(() => {});
 
     let accumulatedText = '';
 
     try {
-      const fullSystemInstruction = getFullSystemInstruction();
+      let fullSystemInstruction = getFullSystemInstruction();
+      if (systemNotes.length > 0) {
+        fullSystemInstruction += `\n\n[USER SYSTEM INSTRUCTION / DIRECTIVE FOR THIS TURN]:\n${systemNotes.map(n => `• ${n}`).join('\n')}`;
+      }
 
       const response = await fetchWithRetry('/api/chat', {
         method: 'POST',
@@ -3688,6 +4024,15 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
       ];
       setMessages(finalizedMsgs);
       syncHistory(finalizedMsgs, finalizedText);
+      sendMessage(targetHistoryId, activeTargetCharacter?.id || persona?.id || 'model', finalizedText, {
+        id: aiMsgId,
+        role: 'ai',
+        text: finalizedText,
+        timestamp: timestampStr,
+        isStreaming: false,
+        alternatives: [finalizedText],
+        activeAlternativeIndex: 0
+      }).catch(() => {});
 
       // Save AI reply to phone thread if user sent a text message
       if (userMsgText.includes('*[Sent a text message to') || userMsgText.includes('on phone]:')) {
@@ -3728,24 +4073,32 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
       runSceneDetection(accumulatedText, userMsgText);
     } catch (err: any) {
       console.error('Chat error:', err);
-      const errMsg = err.message || 'Connection failed.';
-      setErrorMsg(errMsg);
+      if (!accumulatedText.trim()) {
+        setTimeout(() => {
+          setIsStreaming(false);
+          handleSendMessage(userMsgText);
+        }, 1200);
+        return;
+      }
+      const safeText = accumulatedText;
       const erroredMsgs: ChatMessage[] = [
         ...updatedHistory,
         {
           id: aiMsgId,
           role: 'ai',
-          text: accumulatedText || `**Error:** ${errMsg}`,
+          text: safeText,
           timestamp: timestampStr,
           isStreaming: false,
-          alternatives: [accumulatedText || `**Error:** ${errMsg}`],
+          alternatives: [safeText],
           activeAlternativeIndex: 0,
         },
       ];
       setMessages(erroredMsgs);
-      syncHistory(erroredMsgs, accumulatedText || 'Connection error.');
+      syncHistory(erroredMsgs, safeText);
     } finally {
-      setIsStreaming(false);
+      if (accumulatedText.trim()) {
+        setIsStreaming(false);
+      }
     }
   };
 
@@ -3781,7 +4134,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
     lastHistoryIdRef.current = targetHistoryId;
 
     const syncHistory = (msgs: ChatMessage[], lastText: string) => {
-      onSaveHistory(targetHistoryId, msgs, lastText, persona.id);
+      onSaveHistory(targetHistoryId, msgs, lastText, persona?.id);
     };
 
     let accumulatedText = '';
@@ -3969,12 +4322,12 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
   const isPerfMode = !!storageConfig?.isPerformanceMode;
 
   const userBubbleStyle = isLight 
-    ? "bg-zinc-900/85 backdrop-blur-xl text-white border border-black/10 shadow-sm"
-    : "bg-white/[0.08] backdrop-blur-xl text-white border border-white/[0.12] shadow-sm";
+    ? "bg-transparent backdrop-blur-2xl text-zinc-900 border border-black/15 shadow-sm"
+    : "bg-transparent backdrop-blur-2xl text-white border border-white/[0.18] shadow-sm";
 
   const aiBubbleStyle = isLight 
-    ? "bg-white/80 backdrop-blur-xl text-zinc-900 border border-black/10 shadow-sm"
-    : "bg-white/[0.03] backdrop-blur-xl text-white/90 border border-white/[0.08] shadow-sm";
+    ? "bg-transparent backdrop-blur-2xl text-zinc-900 border border-black/10 shadow-sm"
+    : "bg-transparent backdrop-blur-2xl text-white/90 border border-white/[0.12] shadow-sm";
 
   const isZeroCharactersMode = !!linkedWorld && (!linkedWorld.linkedCharacterIds || linkedWorld.linkedCharacterIds.length === 0);
 
@@ -4062,24 +4415,14 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         )}
       </AnimatePresence>
 
-      {/* ENERGY < 20% EXHAUSTION BANNER */}
-      {((characterState?.status?.energy ?? 90) < 20) && (
-        <div className="pointer-events-none absolute top-14 left-0 right-0 z-20 flex justify-center px-4">
-          <div className="bg-zinc-950/90 border border-amber-500/30 text-amber-200 text-xs px-3.5 py-1.5 rounded-full shadow-lg flex items-center gap-2">
-            <span className="text-amber-400 font-bold">⚡</span>
-            <span className="font-medium">Extreme Exhaustion (Energy &lt; 20%)</span>
-          </div>
-        </div>
-      )}
-
       {/* PHONE INTERFACE TOGGLE BUTTON */}
       <button
         type="button"
         onClick={handleOpenPhone}
         title="Open Character Phone"
-        className="absolute right-0 top-[calc(50%-5.5rem)] -translate-y-1/2 z-30 flex items-center justify-center w-8 h-20 bg-zinc-950/85 hover:bg-zinc-900 border-y border-l border-white/15 rounded-l-2xl text-white/90 shadow-xl transition-all cursor-pointer group active:scale-95"
+        className="absolute right-0 top-[calc(50%-5.5rem)] -translate-y-1/2 z-30 flex items-center justify-center w-8 h-20 bg-transparent hover:bg-white/[0.08] backdrop-blur-2xl border-y border-l border-white/[0.2] rounded-l-2xl text-white/90 shadow-2xl transition-all cursor-pointer group active:scale-95"
       >
-        <Smartphone className="w-4 h-4 text-white/80 group-hover:text-white group-hover:scale-110 transition-transform" />
+        <Smartphone className="w-4 h-4 text-white/80 group-hover:text-white group-hover:scale-110 transition-transform drop-shadow-[0_0_8px_rgba(255,255,255,0.4)]" />
       </button>
 
       {/* RIGHT DRAWER TOGGLE BUTTON */}
@@ -4091,15 +4434,28 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
             setIsDrawerOpen(prev => !prev);
           }}
           title="Toggle Status & World Info"
-          className="absolute right-0 top-1/2 -translate-y-1/2 z-30 flex items-center justify-center w-8 h-20 bg-zinc-950/85 hover:bg-zinc-900 border-y border-l border-white/15 rounded-l-2xl text-white/90 shadow-xl transition-all cursor-pointer group active:scale-95"
+          className="absolute right-0 top-1/2 -translate-y-1/2 z-30 flex items-center justify-center w-8 h-20 bg-transparent hover:bg-white/[0.08] backdrop-blur-2xl border-y border-l border-white/[0.2] rounded-l-2xl text-white/90 shadow-2xl transition-all cursor-pointer group active:scale-95"
         >
-          <ChevronLeft className="w-4 h-4 text-white/80 group-hover:text-white group-hover:-translate-x-0.5 transition-transform" />
+          <ChevronLeft className="w-4 h-4 text-white/80 group-hover:text-white group-hover:-translate-x-0.5 transition-transform drop-shadow-[0_0_8px_rgba(255,255,255,0.4)]" />
         </button>
       )}
       
-      {/* Immersive World & Custom Scene Wallpaper Background */}
+      {/* Immersive World & Custom Scene Wallpaper Background (Strictly Image Wallpapers) */}
       {displayedWallpaperUrl && (
         <LiveWallpaperLayer wallpaperUrl={displayedWallpaperUrl} isPerfMode={isPerfMode} />
+      )}
+
+      {/* Headless Ambient System Video Player (Plays in system background, non-visible) */}
+      {activeAmbientVideoUrl && (
+        <video 
+          src={activeAmbientVideoUrl} 
+          autoPlay 
+          loop 
+          muted 
+          playsInline 
+          {...({ 'webkit-playsinline': 'true' } as any)}
+          style={{ display: 'none' }} 
+        />
       )}
 
       {/* Cinematic Place & Scene Switching Black Fade Layer */}
@@ -4994,7 +5350,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
               transition={{ duration: 0.15 }}
-              className="absolute inset-x-0 bottom-0 z-50 p-5 pb-7 font-sans bg-[#0d0d0f]/95 backdrop-blur-md border-t border-x border-white/20 rounded-t-[28px] shadow-2xl text-white select-none max-h-[85vh] overflow-y-auto scrollbar-none"
+              className="absolute inset-x-0 bottom-0 z-50 p-5 pb-7 font-sans bg-transparent backdrop-blur-3xl border-t border-x border-white/[0.16] rounded-t-[28px] shadow-[0_-12px_40px_rgba(0,0,0,0.7)] text-white select-none max-h-[85vh] overflow-y-auto scrollbar-none"
             >
               {/* Top Drag Handle */}
               <div 
@@ -5022,13 +5378,13 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                           setWorldTabSection('world');
                         }
                       }}
-                      className="p-1 -ml-1 hover:bg-white/10 rounded-lg text-white/80 hover:text-white transition-colors cursor-pointer flex items-center gap-1 text-xs font-semibold mr-1"
+                      className="p-1.5 -ml-1 bg-transparent hover:bg-white/[0.08] border border-white/[0.15] backdrop-blur-xl rounded-xl text-white/80 hover:text-white transition-colors cursor-pointer flex items-center gap-1 text-xs font-semibold mr-1 shadow-sm"
                     >
                       <ChevronLeft className="w-4 h-4" />
                       <span>Back</span>
                     </button>
                   )}
-                  <div className="w-2 h-2 rounded-full bg-white/80" />
+                  <div className="w-2 h-2 rounded-full bg-white/80 shadow-[0_0_8px_rgba(255,255,255,0.6)]" />
                   <span className="text-xs font-bold uppercase tracking-widest text-white/90">
                     {worldTabSection === 'grid' && "World Tab"}
                     {worldTabSection === 'world' && "World Section"}
@@ -5040,8 +5396,6 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     {worldTabSection === 'world_calendar' && "Calendar & Time"}
                     {worldTabSection === 'world_location' && "Current Location"}
                     {worldTabSection === 'world_weather' && "Weather & Atmosphere"}
-                    {worldTabSection === 'world_relationships' && "Relationships"}
-                    {worldTabSection === 'world_reputation' && "World Reputation"}
                     {worldTabSection === 'world_scenes' && "Scenes & Soundscapes"}
                     {worldTabSection === 'char_status' && "Current Status"}
                     {worldTabSection === 'char_activity' && "Activity & Job"}
@@ -5057,7 +5411,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     setShowBottomSheet(false);
                     setWorldTabSection('grid');
                   }}
-                  className="w-7 h-7 rounded-full bg-white/10 hover:bg-white/20 border border-white/15 flex items-center justify-center text-white/80 hover:text-white transition-all cursor-pointer"
+                  className="w-7 h-7 rounded-full bg-transparent hover:bg-white/[0.08] border border-white/[0.15] backdrop-blur-xl flex items-center justify-center text-white/80 hover:text-white transition-all cursor-pointer shadow-sm"
                 >
                   <X className="w-3.5 h-3.5" />
                 </button>
@@ -5073,7 +5427,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       triggerHaptic();
                       setWorldTabSection('world');
                     }}
-                    className="w-full min-h-[84px] py-3.5 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/12 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="w-full min-h-[84px] py-3.5 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <Globe className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-xs font-bold tracking-wide text-white text-center leading-tight">
@@ -5088,7 +5442,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       triggerHaptic();
                       setWorldTabSection('character');
                     }}
-                    className="w-full min-h-[84px] py-3.5 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/12 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="w-full min-h-[84px] py-3.5 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <User className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-xs font-bold tracking-wide text-white text-center leading-tight">
@@ -5103,7 +5457,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       triggerHaptic();
                       setWorldTabSection('actions');
                     }}
-                    className="w-full min-h-[84px] py-3.5 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/12 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="w-full min-h-[84px] py-3.5 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <Zap className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-xs font-bold tracking-wide text-white text-center leading-tight">
@@ -5118,7 +5472,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       triggerHaptic();
                       setWorldTabSection('chat_tools');
                     }}
-                    className="w-full min-h-[84px] py-3.5 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/12 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="w-full min-h-[84px] py-3.5 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <Sliders className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-xs font-bold tracking-wide text-white text-center leading-tight">
@@ -5128,9 +5482,9 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                 </div>
               )}
 
-              {/* WORLD SECTION (6 EQUAL BUTTONS) */}
+              {/* WORLD SECTION (4 EQUAL BUTTONS) */}
               {worldTabSection === 'world' && (
-                <div className="grid grid-cols-3 gap-3">
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                   {/* Calendar */}
                   <button
                     type="button"
@@ -5138,7 +5492,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       triggerHaptic();
                       setWorldTabSection('world_calendar');
                     }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <Calendar className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">
@@ -5153,7 +5507,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       triggerHaptic();
                       setWorldTabSection('world_location');
                     }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <MapPin className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">
@@ -5168,41 +5522,11 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       triggerHaptic();
                       setWorldTabSection('world_weather');
                     }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <CloudSun className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">
                       Weather
-                    </span>
-                  </button>
-
-                  {/* Relationships */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      triggerHaptic();
-                      setWorldTabSection('world_relationships');
-                    }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
-                  >
-                    <Users className="w-6 h-6 text-white mb-1.5" />
-                    <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">
-                      Relationships
-                    </span>
-                  </button>
-
-                  {/* Reputation */}
-                  <button
-                    type="button"
-                    onClick={() => {
-                      triggerHaptic();
-                      setWorldTabSection('world_reputation');
-                    }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
-                  >
-                    <Award className="w-6 h-6 text-white mb-1.5" />
-                    <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">
-                      Reputation
                     </span>
                   </button>
 
@@ -5213,7 +5537,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       triggerHaptic();
                       setWorldTabSection('world_scenes');
                     }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <Palette className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">
@@ -5224,13 +5548,12 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
               )}
 
               {/* CHARACTER SUBVIEW */}
-              {/* CHARACTER SUBVIEW */}
               {worldTabSection === 'character' && (
                 <div className="grid grid-cols-3 gap-3">
                   <button
                     type="button"
                     onClick={() => { triggerHaptic(); setWorldTabSection('char_status'); }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <Activity className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">Current Status</span>
@@ -5238,7 +5561,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                   <button
                     type="button"
                     onClick={() => { triggerHaptic(); setWorldTabSection('char_activity'); }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <Briefcase className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">Activity</span>
@@ -5246,7 +5569,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                   <button
                     type="button"
                     onClick={() => { triggerHaptic(); setWorldTabSection('char_inventory'); }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <Package className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">Inventory</span>
@@ -5254,7 +5577,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                   <button
                     type="button"
                     onClick={() => { triggerHaptic(); setWorldTabSection('char_appearance'); }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <Shirt className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">Appearance</span>
@@ -5262,7 +5585,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                   <button
                     type="button"
                     onClick={() => { triggerHaptic(); setWorldTabSection('char_phone'); }}
-                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-white/10 hover:bg-white/15 border border-white/15 cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
+                    className="aspect-square w-full min-h-[96px] h-24 sm:h-28 flex flex-col items-center justify-center p-3 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] backdrop-blur-2xl cursor-pointer transition-all text-center select-none shadow-sm active:scale-[0.96]"
                   >
                     <Smartphone className="w-6 h-6 text-white mb-1.5" />
                     <span className="text-[11px] font-bold tracking-wide text-white text-center leading-tight">Phone</span>
@@ -5773,7 +6096,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                             triggerHaptic();
                             setPendingActionModal({ title: act.title, category: 'Time' });
                           }}
-                          className="p-3.5 rounded-xl bg-white/10 hover:bg-white/10 border border-white/20 text-white font-bold text-xs text-left cursor-pointer transition-all active:scale-[0.97]"
+                          className="p-3.5 rounded-2xl bg-white/[0.08] hover:bg-white/[0.16] active:bg-white/[0.22] border border-white/[0.14] backdrop-blur-xl text-white font-bold text-xs text-left cursor-pointer transition-all active:scale-[0.97] shadow-sm"
                         >
                           <div className="text-white">{act.title}</div>
                           <div className="text-[10px] text-white/50 font-normal mt-0.5">{act.desc}</div>
@@ -5802,7 +6125,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                             triggerHaptic();
                             setPendingActionModal({ title: act.title, category: 'Activities' });
                           }}
-                          className="p-3 rounded-xl bg-white/10 hover:bg-white/10 border border-white/20 text-white font-bold text-xs text-left cursor-pointer transition-all active:scale-[0.97]"
+                          className="p-3 rounded-2xl bg-white/[0.08] hover:bg-white/[0.16] active:bg-white/[0.22] border border-white/[0.14] backdrop-blur-xl text-white font-bold text-xs text-left cursor-pointer transition-all active:scale-[0.97] shadow-sm"
                         >
                           <div className="flex items-center gap-1.5">
                             <span>{act.icon}</span>
@@ -5831,7 +6154,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                             triggerHaptic();
                             setPendingActionModal({ title: act.title, category: 'Planning' });
                           }}
-                          className="p-3.5 rounded-xl bg-white/10 hover:bg-white/10 border border-white/20 text-white font-bold text-xs text-left cursor-pointer transition-all active:scale-[0.97]"
+                          className="p-3.5 rounded-2xl bg-white/[0.08] hover:bg-white/[0.16] active:bg-white/[0.22] border border-white/[0.14] backdrop-blur-xl text-white font-bold text-xs text-left cursor-pointer transition-all active:scale-[0.97] shadow-sm"
                         >
                           <div className="text-white">{act.title}</div>
                           <div className="text-[10px] text-white/50 font-normal mt-0.5">{act.desc}</div>
@@ -5891,10 +6214,10 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                             setActiveChatToolModal(item.id as any);
                           }
                         }}
-                        className="w-full p-3.5 rounded-2xl border border-white/15 bg-white/10 hover:bg-white/15 text-left cursor-pointer transition-all flex items-center justify-between active:scale-[0.98]"
+                        className="w-full p-3.5 rounded-2xl border border-white/[0.14] bg-white/[0.08] hover:bg-white/[0.16] active:bg-white/[0.22] backdrop-blur-xl text-left cursor-pointer transition-all flex items-center justify-between active:scale-[0.98] shadow-sm"
                       >
                         <div className="flex items-center gap-3">
-                          <div className="w-9 h-9 rounded-xl bg-white/10 border border-white/20 flex items-center justify-center text-white">
+                          <div className="w-9 h-9 rounded-xl bg-white/[0.08] border border-white/[0.15] backdrop-blur-md flex items-center justify-center text-white">
                             <ItemIcon className="w-5 h-5" />
                           </div>
                           <div>
@@ -6110,379 +6433,18 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                   </div>
                 </div>
               )}
-
-              {/* RELATIONSHIPS SUBVIEW */}
-              {worldTabSection === 'world_relationships' && (() => {
-                const availableCharacters: Persona[] = [];
-                const seen = new Set<string>();
-                const allKnown = [...PERSONAS, ...(storageConfig?.characters || [])];
-
-                // 1. Linked World Characters (exclude any world profile objects)
-                if (linkedWorld) {
-                  if (linkedWorld.linkedCharacterIds && Array.isArray(linkedWorld.linkedCharacterIds)) {
-                    linkedWorld.linkedCharacterIds.forEach((cid: string) => {
-                      const found = allKnown.find(item => item.id === cid && !item.id.startsWith('world-'));
-                      if (found && !seen.has(found.id)) {
-                        availableCharacters.push(found);
-                        seen.add(found.id);
-                      }
-                    });
-                  }
-                  if ((linkedWorld as any).characters && Array.isArray((linkedWorld as any).characters)) {
-                    (linkedWorld as any).characters.forEach((c: any) => {
-                      if (c && c.id && !c.id.startsWith('world-') && !seen.has(c.id)) {
-                        availableCharacters.push(c);
-                        seen.add(c.id);
-                      }
-                    });
-                  }
-                }
-
-                // 2. Active persona if real character
-                if (persona && persona.id && !persona.id.startsWith('world-') && !seen.has(persona.id)) {
-                  availableCharacters.push(persona);
-                  seen.add(persona.id);
-                }
-
-                // 3. Fallback to activeTargetCharacter if real character
-                if (availableCharacters.length === 0 && activeTargetCharacter && !activeTargetCharacter.id.startsWith('world-')) {
-                  availableCharacters.push(activeTargetCharacter);
-                  seen.add(activeTargetCharacter.id);
-                }
-
-                const activeRelChar = availableCharacters.find(c => c.id === selectedRelCharId) || availableCharacters[0] || (activeTargetCharacter && !activeTargetCharacter.id.startsWith('world-') ? activeTargetCharacter : null);
-
-                if (!activeRelChar) {
-                  return (
-                    <div className="p-6 rounded-2xl bg-white/5 border border-white/10 text-center space-y-2">
-                      <div className="text-sm font-bold text-white/90">No Characters Linked</div>
-                      <p className="text-xs text-white/50 leading-relaxed">
-                        There are currently no characters linked to this world. Link characters in the World settings to track individual relationship dynamics.
-                      </p>
-                    </div>
-                  );
-                }
-
-                const charScores = charRelScores[activeRelChar.id] || getInitialCharScores(activeRelChar.id, activeRelChar.name);
-
-                const METRIC_DEFS = [
-                  { 
-                    key: 'attraction', 
-                    label: 'Attraction', 
-                    icon: '💖',
-                    color: 'text-white',
-                    gradient: 'from-pink-500 to-rose-400',
-                    getDesc: (v: number) => v <= 2 ? 'Indifferent' : v <= 4 ? 'Curious' : v <= 6 ? 'Flirtatious' : v <= 8 ? 'Infatuated' : 'Deeply In Love'
-                  },
-                  { 
-                    key: 'lust', 
-                    label: 'Lust', 
-                    icon: '🫦',
-                    color: 'text-white',
-                    gradient: 'from-fuchsia-500 to-pink-500',
-                    getDesc: (v: number) => v <= 2 ? 'Apathetic' : v <= 4 ? 'Teased' : v <= 6 ? 'Desirous' : v <= 8 ? 'Lustful' : 'Carnal Obsession'
-                  },
-                  { 
-                    key: 'friendship', 
-                    label: 'Friendship', 
-                    icon: '🤝',
-                    color: 'text-white',
-                    gradient: 'from-emerald-500 to-teal-400',
-                    getDesc: (v: number) => v <= 2 ? 'Distant' : v <= 4 ? 'Acquaintance' : v <= 6 ? 'Friendly' : v <= 8 ? 'Close Friend' : 'Soulmate'
-                  },
-                  { 
-                    key: 'trust', 
-                    label: 'Trust', 
-                    icon: '🛡️',
-                    color: 'text-sky-400',
-                    gradient: 'from-sky-500 to-blue-400',
-                    getDesc: (v: number) => v <= 2 ? 'Suspicious' : v <= 4 ? 'Cautious' : v <= 6 ? 'Trusting' : v <= 8 ? 'Confidant' : 'Unwavering Faith'
-                  },
-                  { 
-                    key: 'respect', 
-                    label: 'Respect', 
-                    icon: '👑',
-                    color: 'text-white',
-                    gradient: 'from-amber-500 to-yellow-400',
-                    getDesc: (v: number) => v <= 2 ? 'Disdainful' : v <= 4 ? 'Unimpressed' : v <= 6 ? 'Respectful' : v <= 8 ? 'Esteemed' : 'Revered Icon'
-                  },
-                  { 
-                    key: 'loyalty', 
-                    label: 'Loyalty', 
-                    icon: '⚜️',
-                    color: 'text-white',
-                    gradient: 'from-indigo-500 to-purple-400',
-                    getDesc: (v: number) => v <= 2 ? 'Fickle' : v <= 4 ? 'Uncommitted' : v <= 6 ? 'Reliable' : v <= 8 ? 'Devoted Ally' : 'Sworn Defender'
-                  },
-                  { 
-                    key: 'fear', 
-                    label: 'Fear', 
-                    icon: '⚡',
-                    color: 'text-white',
-                    gradient: 'from-purple-600 to-fuchsia-500',
-                    getDesc: (v: number) => v <= 2 ? 'Unfazed' : v <= 4 ? 'Wary' : v <= 6 ? 'Intimidated' : v <= 8 ? 'Terrified' : 'Petrified'
-                  },
-                  { 
-                    key: 'anger', 
-                    label: 'Anger', 
-                    icon: '💥',
-                    color: 'text-white',
-                    gradient: 'from-rose-600 to-red-600',
-                    getDesc: (v: number) => v <= 2 ? 'Calm' : v <= 4 ? 'Annoyed' : v <= 6 ? 'Irritated' : v <= 8 ? 'Furious' : 'Enraged'
-                  },
-                  { 
-                    key: 'rivalry', 
-                    label: 'Rivalry', 
-                    icon: '⚔️',
-                    color: 'text-orange-400',
-                    gradient: 'from-orange-500 to-amber-600',
-                    getDesc: (v: number) => v <= 2 ? 'Friendly Match' : v <= 4 ? 'Competitive' : v <= 6 ? 'Fierce Rival' : v <= 8 ? 'Bitter Rival' : 'Archenemy'
-                  },
-                ];
-
-                const metrics = METRIC_DEFS.map(d => ({
-                  ...d,
-                  value: (charScores as any)[d.key] ?? 5,
-                  desc: d.getDesc((charScores as any)[d.key] ?? 5)
-                }));
-
-                // Calculate Dominant Emotional Mood Disposition
-                let dominantMood = '😊 Calm & Observant';
-                let dominantBg = 'from-indigo-500/10 to-blue-500/10 border-white/20';
-                
-                if (charScores.anger >= 7) {
-                  dominantMood = `🔥 Furious & Resentful (${charScores.anger}/10 Anger)`;
-                  dominantBg = 'from-rose-500/20 to-red-600/20 border-white/20';
-                } else if (charScores.lust >= 8) {
-                  dominantMood = `🫦 Overcome with Lust & Passion (${charScores.lust}/10 Lust)`;
-                  dominantBg = 'from-fuchsia-500/20 to-pink-500/20 border-white/20';
-                } else if (charScores.attraction >= 8) {
-                  dominantMood = `💘 Deeply Enamored & Infatuated (${charScores.attraction}/10 Attraction)`;
-                  dominantBg = 'from-pink-500/20 to-rose-500/20 border-white/20';
-                } else if (charScores.fear >= 7) {
-                  dominantMood = `⚡ Terrified & Apprehensive (${charScores.fear}/10 Fear)`;
-                  dominantBg = 'from-purple-500/20 to-fuchsia-600/20 border-white/20';
-                } else if (charScores.respect <= 2 && charScores.anger >= 4) {
-                  dominantMood = `😤 Disdainful & Unimpressed (${charScores.respect}/10 Respect)`;
-                  dominantBg = 'from-amber-500/20 to-orange-600/20 border-white/20';
-                } else if (charScores.trust >= 8 && charScores.friendship >= 8) {
-                  dominantMood = `✨ Devoted & Deeply Trusted Companion (${charScores.trust}/10 Trust)`;
-                  dominantBg = 'from-emerald-500/20 to-teal-500/20 border-white/20';
-                } else if (charScores.rivalry >= 7) {
-                  dominantMood = `⚔️ Fiercely Competitive Rival (${charScores.rivalry}/10 Rivalry)`;
-                  dominantBg = 'from-orange-500/20 to-amber-500/20 border-orange-500/30';
-                } else if (charScores.respect >= 8) {
-                  dominantMood = `👑 Highly Revered & Respected (${charScores.respect}/10 Respect)`;
-                  dominantBg = 'from-amber-500/20 to-yellow-500/20 border-white/20';
-                }
-
-                const updateMetricScore = (metricKey: string, newValue: number, commit = true) => {
-                  const val = Math.max(1, Math.min(10, Math.round(newValue)));
-                  triggerHaptic();
-
-                  setCharRelScores(prev => {
-                    const existingScores = prev[activeRelChar.id] || charScores;
-                    if ((existingScores as any)[metricKey] === val) return prev;
-
-                    const nextCharScores = {
-                      ...existingScores,
-                      [metricKey]: val
-                    };
-                    const nextAllScores = {
-                      ...prev,
-                      [activeRelChar.id]: nextCharScores
-                    };
-
-                    if (commit && targetHistoryId && onUpdateConfig && storageConfig) {
-                      setTimeout(() => {
-                        const currentHistories = storageConfig?.chatHistories || [];
-                        const updatedHistories = currentHistories.map(h => 
-                          h.id === targetHistoryId ? { ...h, relationshipScores: nextAllScores } : h
-                        );
-                        onUpdateConfig({ chatHistories: updatedHistories });
-                      }, 0);
-                    }
-
-                    return nextAllScores;
-                  });
-                };
-
-                const commitMetricScores = () => {
-                  if (targetHistoryId && onUpdateConfig && storageConfig) {
-                    const currentHistories = storageConfig?.chatHistories || [];
-                    const updatedHistories = currentHistories.map(h => 
-                      h.id === targetHistoryId ? { ...h, relationshipScores: charRelScores } : h
-                    );
-                    onUpdateConfig({ chatHistories: updatedHistories });
-                  }
-                };
-
-                return (
-                  <div className="space-y-3.5">
-                    {/* Character Picker */}
-                    <div className="space-y-1.5">
-                      <label className="text-[10px] font-bold uppercase tracking-wider text-white/50 block px-1">Linked Characters</label>
-                      <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-none">
-                        {availableCharacters.map(charItem => {
-                          const isSelected = charItem.id === activeRelChar.id;
-                          return (
-                            <button
-                              key={charItem.id}
-                              type="button"
-                              onClick={() => {
-                                triggerHaptic();
-                                setSelectedRelCharId(charItem.id);
-                              }}
-                              className={`flex items-center gap-2 px-3 py-2 rounded-xl border text-xs font-bold transition-all flex-shrink-0 cursor-pointer ${
-                                isSelected 
-                                  ? 'bg-white text-black border-white' 
-                                  : 'bg-white/5 text-white/80 border-white/10 hover:bg-white/10'
-                              }`}
-                            >
-                              {charItem.avatar ? (
-                                <SafeImage src={charItem.avatar} className="w-5 h-5 rounded-full object-cover" alt="" />
-                              ) : (
-                                <div className="w-5 h-5 rounded-full bg-white/20 flex items-center justify-center text-[10px]">
-                                  {charItem.name.charAt(0)}
-                                </div>
-                              )}
-                              <span>{charItem.name}</span>
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-
-                    {/* Character Relationship Header & Dominant Disposition */}
-                    <div className="p-3.5 rounded-2xl bg-white/5 border border-white/10 space-y-2.5">
-                      <div className="flex items-center gap-3">
-                        {activeRelChar.avatar ? (
-                          <SafeImage src={activeRelChar.avatar} className="w-10 h-10 rounded-xl object-cover border border-white/15" alt="" />
-                        ) : (
-                          <div className="w-10 h-10 rounded-xl bg-white/10 border border-white/15 flex items-center justify-center font-bold text-white">
-                            {activeRelChar.name.charAt(0)}
-                          </div>
-                        )}
-                        <div>
-                          <div className="text-xs font-bold text-white">{activeRelChar.name}'s Attitude toward You</div>
-                          <div className="text-[10px] text-white/50">User Persona: {activeUserPersona?.name || currentPersonaName}</div>
-                        </div>
-                      </div>
-
-                      {/* Dominant Emotional Disposition Banner */}
-                      <div className={`p-2.5 rounded-xl border bg-gradient-to-r ${dominantBg} flex items-center justify-between`}>
-                        <div className="text-[10px] font-bold uppercase tracking-wider text-white/60">Current Disposition</div>
-                        <div className="text-xs font-bold text-white">{dominantMood}</div>
-                      </div>
-                    </div>
-
-                    {/* 8 Relationship Rating Bars */}
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                      {metrics.map(m => (
-                        <div key={m.label} className="p-3 rounded-xl bg-white/5 border border-white/10 flex flex-col gap-2">
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-1.5 text-xs font-bold text-white">
-                              <span>{m.icon}</span>
-                              <span className={m.color}>{m.label}</span>
-                            </div>
-                            <div className="flex items-center gap-1.5">
-                              <span className="text-[10px] font-extrabold uppercase px-2 py-0.5 rounded-md bg-white/10 text-white/90 border border-white/10">
-                                {m.desc}
-                              </span>
-                              <span className="font-mono text-white/90 text-xs font-bold w-6 text-center">{m.value}/10</span>
-                            </div>
-                          </div>
-
-                          <div className="flex items-center gap-2 pt-0.5">
-                            <button
-                              type="button"
-                              onClick={() => updateMetricScore(m.key, m.value - 1, true)}
-                              className="w-6 h-6 rounded-lg bg-white/10 hover:bg-white/20 active:scale-90 text-white flex items-center justify-center text-xs font-bold cursor-pointer transition-transform flex-shrink-0"
-                            >
-                              -
-                            </button>
-
-                            <div className="relative flex-1 flex items-center">
-                              <input
-                                type="range"
-                                min="1"
-                                max="10"
-                                step="1"
-                                value={m.value}
-                                onChange={(e) => updateMetricScore(m.key, Number(e.target.value), false)}
-                                onMouseUp={commitMetricScores}
-                                onTouchEnd={commitMetricScores}
-                                className="w-full h-2 rounded-lg bg-white/10 appearance-none cursor-pointer accent-purple-400 touch-pan-x"
-                              />
-                            </div>
-
-                            <button
-                              type="button"
-                              onClick={() => updateMetricScore(m.key, m.value + 1, true)}
-                              className="w-6 h-6 rounded-lg bg-white/10 hover:bg-white/20 active:scale-90 text-white flex items-center justify-center text-xs font-bold cursor-pointer transition-transform flex-shrink-0"
-                            >
-                              +
-                            </button>
-                          </div>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {/* REPUTATION SUBVIEW */}
-              {worldTabSection === 'world_reputation' && (
-                <div className="space-y-4">
-                  <div className="p-4 rounded-2xl bg-white/5 border border-white/10 space-y-2">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-white/50 block">Current Standing & Reputation</span>
-                    <div className="text-sm font-semibold text-white">{worldReputationInput || "Neutral"}</div>
-                    <p className="text-[10px] text-white/40 leading-relaxed">
-                      Your standing in this world influences how factions, characters, and authorities treat you.
-                    </p>
-                  </div>
-
-                  <div className="space-y-2">
-                    <label className="text-[10px] font-bold uppercase tracking-wider text-white/60 block">Edit Reputation</label>
-                    <input 
-                      type="text"
-                      value={worldReputationInput ?? ""}
-                      onChange={(e) => setWorldReputationInput(e.target.value)}
-                      placeholder="e.g. Honored Guest (7/10)"
-                      className="w-full bg-white/10 border border-white/15 rounded-xl p-3 text-xs text-white placeholder-white/30 focus:outline-none focus:border-white/30"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => {
-                        triggerHaptic();
-                        if (targetHistoryId && onUpdateConfig && storageConfig) {
-                          const currentHistories = storageConfig?.chatHistories || [];
-                          const updatedHistories = currentHistories.map(h => 
-                            h.id === targetHistoryId ? { ...h, worldReputation: worldReputationInput } : h
-                          );
-                          onUpdateConfig({ chatHistories: updatedHistories });
-                        }
-                        triggerToast("Reputation updated & saved");
-                      }}
-                      className="w-full py-3 rounded-xl bg-white text-black font-bold text-xs flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-[0.98]"
-                    >
-                      <Save className="w-4 h-4" />
-                      <span>Save Reputation Info</span>
-                    </button>
-                  </div>
-                </div>
-              )}
             </motion.div>
           </>
         )}
       </AnimatePresence>
 
       {/* Top Chat Header */}
-      <div className={`p-2.5 px-5 backdrop-blur-sm border-b flex items-center justify-between z-10 shadow-sm ${isLight ? 'bg-white/90 border-black/10' : 'bg-[#121215]/90 border-white/[0.08]'}`}>
-        <div className="flex items-center gap-3">
+      <div className={`px-5 pb-2.5 pt-[calc(env(safe-area-inset-top,0px)+0.625rem)] backdrop-blur-2xl border-b flex items-center justify-between z-10 transition-colors ${isLight ? 'bg-[#F8F9FA]/90 border-black/10' : 'bg-[#0A0A0A]/35 border-white/[0.12]'}`}>
+        <div className="flex items-center gap-2.5">
           <button
             onClick={onBack}
-            className={`p-2 -ml-2 rounded-full active:scale-[0.88] transition-all duration-100 animate-scaleIn ${isLight ? 'hover:bg-black/5 text-black/40' : 'hover:bg-white/[0.08] text-white/50 hover:text-white'}`}
+            className={`p-2 -ml-2 rounded-full active:scale-[0.88] transition-all duration-100 animate-scaleIn backdrop-blur-xl border ${isLight ? 'bg-black/[0.03] hover:bg-black/5 border-black/10 text-black/70' : 'bg-white/[0.04] hover:bg-white/[0.08] border-white/[0.16] text-white'}`}
+            title="Go back"
           >
             <ArrowLeft className="w-4 h-4" />
           </button>
@@ -6490,7 +6452,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
           <div 
             onClick={() => {
               triggerHaptic();
-              if (linkedWorld && persona.id.startsWith('world-')) {
+              if (linkedWorld && persona?.id && persona.id.startsWith('world-')) {
                 setShowWorldProfile(true);
               } else if (!isZeroCharactersMode) {
                 setShowProfile(true);
@@ -6498,7 +6460,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                 setShowWorldProfile(true);
               }
             }}
-            className={`flex items-center gap-2.5 cursor-pointer p-1 px-1.5 rounded-xl transition-all active:scale-[0.98] ${isLight ? 'hover:bg-black/5' : 'hover:bg-white/[0.04]'}`}
+            className={`flex items-center gap-2.5 cursor-pointer p-1.5 px-2.5 rounded-2xl transition-all active:scale-[0.98] backdrop-blur-xl border ${isLight ? 'bg-transparent hover:bg-black/5 border-black/10' : 'bg-transparent hover:bg-white/[0.08] border-white/[0.15]'}`}
             title="View Profile"
           >
             <div className="relative">
@@ -6516,14 +6478,14 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                 <div className={`w-8 h-8 rounded-lg bg-white/[0.04] border flex items-center justify-center shadow-sm ${isLight ? 'border-black/10' : 'border-white/[0.08]'}`}>
                     <User className="w-4 h-4 text-white/20" />
                 </div>
-              ) : persona.avatar ? (
+              ) : persona?.avatar ? (
                 <SafeImage 
                   src={persona.avatar} 
                   className={`w-8 h-8 rounded-lg object-cover border shadow-sm ${isLight ? 'border-black/10' : 'border-white/[0.1]'}`} 
                   alt={characterName}
                 />
               ) : (
-                <div className={`w-8 h-8 rounded-lg bg-gradient-to-br ${persona.avatarGradient} border flex items-center justify-center shadow-sm ${isLight ? 'border-black/10' : 'border-white/[0.08]'}`}>
+                <div className={`w-8 h-8 rounded-lg bg-gradient-to-br ${persona?.avatarGradient || 'from-indigo-500 to-purple-600'} border flex items-center justify-center shadow-sm ${isLight ? 'border-black/10' : 'border-white/[0.08]'}`}>
                   <span className="text-white font-bold text-xs">{characterName.charAt(0).toUpperCase()}</span>
                 </div>
               )}
@@ -6542,13 +6504,13 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         </div>
 
         <div className="flex items-center gap-2 z-20">
-          <div className="flex items-center bg-white/[0.04] border border-white/[0.08] rounded-xl p-0.5 shadow-sm">
+          <div className={`flex items-center rounded-2xl p-0.5 shadow-sm border backdrop-blur-xl ${isLight ? 'bg-black/[0.03] border-black/10' : 'bg-white/[0.04] border-white/[0.16]'}`}>
             <button
               onClick={() => { triggerHaptic(); setShowManualOverrideModal(true); }}
-              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg transition-all active:scale-[0.95] cursor-pointer ${
+              className={`flex items-center gap-1.5 px-2.5 py-1.5 rounded-xl transition-all active:scale-[0.95] cursor-pointer ${
                 isLight 
                   ? 'hover:bg-black/5 text-zinc-700' 
-                  : 'hover:bg-white/[0.08] text-white hover:text-white'
+                  : 'hover:bg-white/[0.08] text-white'
               }`}
               title="Scene & Wallpaper Controls"
             >
@@ -6556,29 +6518,29 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
               <span className="text-[9px] font-bold uppercase tracking-wider hidden xs:inline">Scene</span>
             </button>
 
-            <div className="w-[1px] h-3 bg-white/10 mx-0.5" />
+            <div className="w-[1px] h-3 bg-white/15 mx-0.5" />
 
             <button
               onClick={() => { triggerHaptic(); handleToggleMute(); }}
-              className={`p-1.5 px-2 rounded-lg transition-all active:scale-[0.95] cursor-pointer ${
+              className={`p-1.5 px-2 rounded-xl transition-all active:scale-[0.95] cursor-pointer ${
                 isAmbientMuted 
-                  ? (isLight ? 'text-white' : 'text-white')
-                  : (isLight ? 'text-zinc-700 hover:text-black' : 'text-white hover:text-white')
+                  ? 'text-white/60' 
+                  : (isLight ? 'text-zinc-700 hover:text-black' : 'hover:bg-white/[0.08] text-white')
               }`}
               title={isAmbientMuted ? "Unmute Ambient" : "Mute Ambient"}
             >
               {isAmbientMuted ? <VolumeX className="w-3.5 h-3.5" /> : <Volume2 className="w-3.5 h-3.5" />}
             </button>
 
-            <div className="w-[1px] h-3 bg-white/10 mx-0.5" />
+            <div className="w-[1px] h-3 bg-white/15 mx-0.5" />
 
             <button
               type="button"
               onClick={handleClearChat}
-              className={`p-1.5 px-2 rounded-lg transition-all active:scale-[0.95] cursor-pointer flex items-center gap-1 ${
+              className={`p-1.5 px-2 rounded-xl transition-all active:scale-[0.95] cursor-pointer flex items-center gap-1 ${
                 isLight 
                   ? 'hover:bg-red-50 text-red-600' 
-                  : 'hover:bg-red-500/20 text-red-400 hover:text-red-300'
+                  : 'hover:bg-red-500/25 text-red-300'
               }`}
               title="Clear Chat History for this character"
             >
@@ -6594,8 +6556,8 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
       </div>
 
       {linkedWorld && (
-        <div className={`py-1.5 px-4 flex items-center gap-2 overflow-x-auto scrollbar-none border-b backdrop-blur-xl z-10 select-none ${
-          isLight ? 'bg-white/70 border-black/5 text-black' : 'bg-white/5 border-white/10 text-white'
+        <div className={`py-1.5 px-4 flex items-center gap-2 overflow-x-auto scrollbar-none border-b backdrop-blur-2xl z-10 select-none ${
+          isLight ? 'bg-transparent border-black/5 text-black' : 'bg-transparent border-white/[0.1] text-white'
         }`}>
           <span className={`text-[10px] font-bold uppercase tracking-wider ${isLight ? 'text-black/50' : 'text-white/50'} whitespace-nowrap shrink-0`}>
             World Cast ({sessionLinkedCharIds.length}):
@@ -6616,14 +6578,14 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       setViewedCompanionProfile(char);
                       setShowProfile(true);
                     }}
-                    className={`flex items-center gap-1.5 p-1 px-2.5 rounded-full border text-[10px] font-semibold active:scale-[0.95] cursor-pointer transition-all shrink-0 backdrop-blur-md ${
+                    className={`flex items-center gap-1.5 p-1 px-2.5 rounded-full border text-[10px] font-semibold active:scale-[0.95] cursor-pointer transition-all shrink-0 backdrop-blur-xl ${
                       isDead
                         ? (isLight 
                             ? 'bg-rose-50/50 border-rose-200/50 text-white/60 grayscale opacity-60' 
                             : 'bg-rose-950/25 border-rose-900/30 text-white/60 grayscale opacity-60')
                         : (isLight 
-                            ? 'bg-black/5 hover:bg-black/10 border-black/10 text-zinc-900 shadow-sm' 
-                            : 'bg-white/10 hover:bg-white/15 border-white/15 text-white shadow-sm')
+                            ? 'bg-transparent hover:bg-black/5 border-black/10 text-zinc-900 shadow-sm' 
+                            : 'bg-transparent hover:bg-white/[0.08] border-white/[0.15] text-white shadow-sm')
                     }`}
                   >
                     {char.avatar ? (
@@ -6649,15 +6611,6 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         </div>
       )}
 
-
-      {/* Error Alert Banner if needed */}
-      {errorMsg && (
-        <div className="bg-white/10 border-b border-white/20 px-4 py-2.5 flex items-center gap-2 text-[11px] text-white font-sans font-light tracking-wide">
-          <AlertCircle className="w-3.5 h-3.5 flex-shrink-0 text-white" />
-          <span className="truncate flex-1">{errorMsg}</span>
-          <button onClick={() => setErrorMsg(null)} className="underline font-bold hover:text-white">Dismiss</button>
-        </div>
-      )}
 
       {/* Messages Scroll Area */}
       <ChatMessageList
@@ -6694,6 +6647,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         isStreaming={isStreaming}
         parsedWorldMessagesCacheRef={parsedWorldMessagesCacheRef}
         lastHistoryIdRef={lastHistoryIdRef}
+        onRewindAndSave={handleRewindAndSave}
       />
 
       {/* Suggested Prompts if only welcome message */}
@@ -6753,7 +6707,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
       )}
 
       {/* Pill Styled Input Bar Container */}
-      <div className="px-4 pt-2 pb-6 sm:pb-8 font-sans flex flex-col items-center transition-all duration-500 bg-transparent">
+      <div className="w-full px-3 sm:px-4 pt-2 pb-6 sm:pb-8 font-sans flex flex-col items-center transition-all duration-500 bg-transparent min-w-0">
         {isStreaming && !showBottomSheet && (
           <div className="fixed bottom-28 left-0 right-0 flex justify-center z-30 pointer-events-none">
             <div className={`flex items-center gap-2 px-4 py-2 rounded-[20px] backdrop-blur-md animate-fade-in border ${
@@ -6789,7 +6743,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                   <button
                     type="button"
                     onClick={() => setShowSuggestedAnswers(false)}
-                    className="hover:text-white transition-all text-[9.5px] cursor-pointer opacity-60 hover:opacity-100"
+                    className="hover:text-white transition-all text-[9.5px] cursor-pointer text-white/60 hover:text-white px-2 py-0.5 rounded-full bg-white/[0.06] hover:bg-white/[0.14] border border-white/[0.1] backdrop-blur-md"
                   >
                     Hide
                   </button>
@@ -6804,7 +6758,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                         setExternalInputText(ans);
                         setShowSuggestedAnswers(false);
                       }}
-                      className="flex-shrink-0 snap-start px-4 py-2.5 rounded-2xl bg-white/[0.05] hover:bg-white/[0.1] active:bg-white/15 border border-white/[0.08] hover:border-white/20 text-[11px] text-white/90 hover:text-white font-sans transition-all active:scale-[0.97] shadow-lg max-w-[280px] truncate cursor-pointer"
+                      className="flex-shrink-0 snap-start px-4 py-2.5 rounded-2xl bg-white/[0.08] hover:bg-white/[0.16] active:bg-white/25 backdrop-blur-2xl border border-white/[0.14] hover:border-white/30 text-[11px] text-white font-sans transition-all active:scale-[0.97] shadow-xl max-w-[280px] truncate cursor-pointer"
                     >
                       {ans}
                     </button>
@@ -6816,6 +6770,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         </AnimatePresence>
 
         <IsolatedChatInput
+          sessionId={activeHistoryId || historyId || persona?.id || 'default_session'}
           characterName={characterName}
           isLight={isLight}
           isStreaming={isStreaming}
@@ -7032,18 +6987,18 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
         <div className="absolute inset-0 z-[60] flex flex-col justify-end overflow-hidden animate-none">
           {/* Backdrop Dimmer */}
           <div
-            className="absolute inset-0 bg-black/60 cursor-pointer backdrop-blur-[2px]"
+            className="absolute inset-0 bg-black/60 cursor-pointer backdrop-blur-md"
             onClick={() => setSelectedMessageForMenu(null)}
           />
           {/* Bottom Sheet Card Container */}
-          <div className="relative w-full bg-[#121214] border-t border-x border-white/[0.08] rounded-t-3xl shadow-[0_-8px_32px_rgba(0,0,0,0.65)] z-10 font-sans px-4 pb-6 pt-3 select-none flex flex-col gap-2.5 max-h-[85vh] overflow-y-auto scrollbar-none animate-none">
+          <div className="relative w-full bg-transparent backdrop-blur-3xl border-t border-x border-white/[0.18] rounded-t-3xl shadow-[0_-8px_32px_rgba(0,0,0,0.7)] z-10 font-sans px-4 pb-6 pt-3 select-none flex flex-col gap-2.5 max-h-[85vh] overflow-y-auto scrollbar-none animate-none">
             {/* Drag Handle Bar */}
-            <div className="w-10 h-1 bg-white/10 rounded-full mx-auto mb-3.5" />
+            <div className="w-10 h-1 bg-white/20 rounded-full mx-auto mb-3.5" />
 
             {/* Header Title */}
             <div className="px-1 mb-1">
-              <p className="text-[10px] text-white/45 uppercase tracking-widest font-bold">Message Options</p>
-              <p className="text-xs text-white/70 truncate mt-1">"{selectedMessageForMenu.text}"</p>
+              <p className="text-[10px] text-white/50 uppercase tracking-widest font-bold">Message Options</p>
+              <p className="text-xs text-white/80 truncate mt-1 font-medium">"{selectedMessageForMenu.text}"</p>
             </div>
 
             {/* Options List with Proper Spacing */}
@@ -7056,18 +7011,18 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                   setSelectedMessageForMenu(null);
                   setShowEditModalForMessage(msgToEdit);
                 }}
-                className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-[#1E1E1E]/40 border border-white/[0.04] hover:bg-white/[0.06] active:scale-[0.98] transition-all text-left cursor-pointer"
+                className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] backdrop-blur-2xl border border-white/[0.15] active:scale-[0.98] transition-all text-left cursor-pointer shadow-sm"
               >
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-white/[0.03] border border-white/[0.06] flex items-center justify-center text-white/70">
+                  <div className="w-8 h-8 rounded-xl bg-transparent border border-white/[0.15] flex items-center justify-center text-white backdrop-blur-md">
                     <Pencil className="w-4 h-4" />
                   </div>
                   <div>
                     <div className="text-xs font-bold text-white">Edit Message</div>
-                    <div className="text-[9px] text-white/40 leading-none mt-0.5">Revise the text content of this message</div>
+                    <div className="text-[9px] text-white/50 leading-none mt-0.5">Revise the text content of this message</div>
                   </div>
                 </div>
-                <ChevronRight className="w-4 h-4 text-white/20" />
+                <ChevronRight className="w-4 h-4 text-white/30" />
               </button>
 
               {/* Option: Retry / Regenerate Response (Only for Assistant messages) */}
@@ -7080,10 +7035,10 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     handleRetryMessage(msgId);
                   }}
                   disabled={isStreaming}
-                  className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-white/10[0.04] border border-white/20 hover:bg-white/10[0.08] active:scale-[0.98] transition-all text-left cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed"
+                  className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] backdrop-blur-2xl border border-white/[0.15] active:scale-[0.98] transition-all text-left cursor-pointer disabled:opacity-45 disabled:cursor-not-allowed shadow-sm"
                 >
                   <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-xl bg-white/10 border border-white/20 flex items-center justify-center text-white">
+                    <div className="w-8 h-8 rounded-xl bg-transparent border border-white/[0.15] flex items-center justify-center text-white backdrop-blur-md">
                       <RefreshCw className="w-4 h-4" />
                     </div>
                     <div>
@@ -7133,17 +7088,17 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     persona.id
                   );
                 }}
-                className={`w-full flex items-center justify-between p-3.5 rounded-2xl active:scale-[0.98] transition-all text-left cursor-pointer ${
+                className={`w-full flex items-center justify-between p-3.5 rounded-2xl active:scale-[0.98] transition-all text-left cursor-pointer backdrop-blur-2xl shadow-sm ${
                   selectedMessageForMenu.isPinned 
-                    ? 'bg-accent/[0.04] border border-accent/25 hover:bg-accent/[0.08]' 
-                    : 'bg-[#1E1E1E]/40 border border-white/[0.04] hover:bg-white/[0.06]'
+                    ? 'bg-transparent border border-accent/40 hover:bg-white/[0.08]' 
+                    : 'bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.15]'
                 }`}
               >
                 <div className="flex items-center gap-3">
-                  <div className={`w-8 h-8 rounded-xl flex items-center justify-center ${
+                  <div className={`w-8 h-8 rounded-xl flex items-center justify-center backdrop-blur-md ${
                     selectedMessageForMenu.isPinned 
-                      ? 'bg-accent/15 border border-accent/25 text-accent' 
-                      : 'bg-white/[0.03] border border-white/[0.06] text-white/70'
+                      ? 'bg-transparent border border-accent/40 text-accent' 
+                      : 'bg-transparent border border-white/[0.15] text-white'
                   }`}>
                     <Pin className={`w-4 h-4 ${selectedMessageForMenu.isPinned ? 'fill-accent text-accent' : ''}`} />
                   </div>
@@ -7151,12 +7106,12 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     <div className={`text-xs font-bold ${selectedMessageForMenu.isPinned ? 'text-accent' : 'text-white'}`}>
                       {selectedMessageForMenu.isPinned ? 'Unpin Message' : 'Pin Message'}
                     </div>
-                    <div className="text-[9px] text-white/40 leading-none mt-0.5">
+                    <div className="text-[9px] text-white/50 leading-none mt-0.5">
                       {selectedMessageForMenu.isPinned ? 'Remove from simulated memory context' : 'Inject directly into character memory context'}
                     </div>
                   </div>
                 </div>
-                <ChevronRight className={`w-4 h-4 ${selectedMessageForMenu.isPinned ? 'text-accent/40' : 'text-white/20'}`} />
+                <ChevronRight className={`w-4 h-4 ${selectedMessageForMenu.isPinned ? 'text-accent/60' : 'text-white/30'}`} />
               </button>
 
               {/* Option: Branch New Session */}
@@ -7184,11 +7139,15 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     const lastText = msg.text || branchedMessages[branchedMessages.length - 1]?.text || '';
                     const timeStr = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
 
+                    const currentPid = persona?.id || sourceSession?.personaId || 'companion';
+                    const currentPName = persona?.name || sourceSession?.personaName || 'Companion';
+                    const currentPGradient = persona?.avatarGradient || sourceSession?.avatarGradient || 'from-purple-500 to-indigo-600';
+
                     const branchedSession: ChatHistory = {
                       id: newSessionId,
-                      personaId: persona.id,
-                      personaName: persona.name,
-                      avatarGradient: persona.avatarGradient || 'from-purple-500 to-indigo-600',
+                      personaId: currentPid,
+                      personaName: currentPName,
+                      avatarGradient: currentPGradient,
                       linkedWorldId: linkedWorldId || sourceSession?.linkedWorldId,
                       userPersonaId: (activeSession as any)?.userPersonaId || sourceSession?.userPersonaId || storageConfig?.activeUserPersonaId,
                       messages: branchedMessages,
@@ -7215,10 +7174,10 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
 
                     const updatedHistories = [branchedSession, ...currentHistories.filter(h => h.id !== newSessionId)];
                     if (onUpdateConfig) {
-                      onUpdateConfig({ chatHistories: updatedHistories, selectedPersonaId: persona.id });
+                      onUpdateConfig({ chatHistories: updatedHistories, selectedPersonaId: currentPid });
                     }
                     if (onSaveHistory) {
-                      onSaveHistory(newSessionId, branchedMessages, lastText, persona.id);
+                      onSaveHistory(newSessionId, branchedMessages, lastText, currentPid);
                     }
 
                     setActiveHistoryId(newSessionId);
@@ -7247,10 +7206,10 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     }, 300);
                   }, 400);
                 }}
-                className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-white/10[0.06] border border-white/20 hover:bg-white/10[0.12] active:scale-[0.98] transition-all text-left cursor-pointer"
+                className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] backdrop-blur-2xl border border-white/[0.15] active:scale-[0.98] transition-all text-left cursor-pointer shadow-sm"
               >
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-white/10 border border-white/20 flex items-center justify-center text-white">
+                  <div className="w-8 h-8 rounded-xl bg-transparent border border-white/[0.15] flex items-center justify-center text-white backdrop-blur-md">
                     <GitFork className="w-4 h-4 text-white" />
                   </div>
                   <div>
@@ -7258,25 +7217,25 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     <div className="text-[9px] text-white/60 leading-none mt-0.5">Duplicate walkthrough from here for alternate endings</div>
                   </div>
                 </div>
-                <ChevronRight className="w-4 h-4 text-white/40" />
+                <ChevronRight className="w-4 h-4 text-white/30" />
               </button>
 
               {/* Option 3: Rewind to here */}
               <button
                 type="button"
                 onClick={() => handleRewindToHere(selectedMessageForMenu.id)}
-                className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-[#1E1E1E]/40 border border-white/[0.04] hover:bg-white/[0.06] active:scale-[0.98] transition-all text-left cursor-pointer"
+                className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] backdrop-blur-2xl border border-white/[0.15] active:scale-[0.98] transition-all text-left cursor-pointer shadow-sm"
               >
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-white/[0.03] border border-white/[0.06] flex items-center justify-center text-white/70">
+                  <div className="w-8 h-8 rounded-xl bg-transparent border border-white/[0.15] flex items-center justify-center text-white backdrop-blur-md">
                     <GitFork className="w-4 h-4 rotate-180" />
                   </div>
                   <div>
                     <div className="text-xs font-bold text-white">Rewind to here</div>
-                    <div className="text-[9px] text-white/40 leading-none mt-0.5">Wipe later messages and fork dialogue state</div>
+                    <div className="text-[9px] text-white/50 leading-none mt-0.5">Wipe later messages and fork dialogue state</div>
                   </div>
                 </div>
-                <ChevronRight className="w-4 h-4 text-white/20" />
+                <ChevronRight className="w-4 h-4 text-white/30" />
               </button>
 
               {/* Option 4: Copy Text */}
@@ -7287,40 +7246,40 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                   setSelectedMessageForMenu(null);
                   triggerToast("Message copied");
                 }}
-                className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-[#1E1E1E]/40 border border-white/[0.04] hover:bg-white/[0.06] active:scale-[0.98] transition-all text-left cursor-pointer"
+                className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] backdrop-blur-2xl border border-white/[0.15] active:scale-[0.98] transition-all text-left cursor-pointer shadow-sm"
               >
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-white/[0.03] border border-white/[0.06] flex items-center justify-center text-white/70">
+                  <div className="w-8 h-8 rounded-xl bg-transparent border border-white/[0.15] flex items-center justify-center text-white backdrop-blur-md">
                     <Copy className="w-4 h-4" />
                   </div>
                   <div>
                     <div className="text-xs font-bold text-white">Copy Text</div>
-                    <div className="text-[9px] text-white/40 leading-none mt-0.5">Save content directly to device clipboard</div>
+                    <div className="text-[9px] text-white/50 leading-none mt-0.5">Save content directly to device clipboard</div>
                   </div>
                 </div>
-                <ChevronRight className="w-4 h-4 text-white/20" />
+                <ChevronRight className="w-4 h-4 text-white/30" />
               </button>
 
               {/* Option 5: Delete Message (Destructive action) */}
               <button
                 type="button"
                 onClick={() => {
-                  setMessages(prev => prev.filter(m => m.id !== selectedMessageForMenu.id));
-                  setSelectedMessageForMenu(null);
-                  triggerToast("Message deleted");
+                  if (selectedMessageForMenu) {
+                    handleDeleteSingleMessage(selectedMessageForMenu.id);
+                  }
                 }}
-                className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-white/10[0.02] border border-white/20 hover:bg-white/10[0.06] hover:border-white/20 active:scale-[0.98] transition-all text-left cursor-pointer"
+                className="w-full flex items-center justify-between p-3.5 rounded-2xl bg-transparent hover:bg-rose-500/[0.12] active:bg-rose-500/[0.18] backdrop-blur-2xl border border-rose-500/[0.25] active:scale-[0.98] transition-all text-left cursor-pointer shadow-sm"
               >
                 <div className="flex items-center gap-3">
-                  <div className="w-8 h-8 rounded-xl bg-white/10 border border-white/20 flex items-center justify-center text-white">
+                  <div className="w-8 h-8 rounded-xl bg-transparent border border-rose-500/30 flex items-center justify-center text-rose-300 backdrop-blur-md">
                     <Trash2 className="w-4 h-4" />
                   </div>
                   <div>
-                    <div className="text-xs font-bold text-white">Delete Message</div>
-                    <div className="text-[9px] text-white/55 leading-none mt-0.5">Irreversibly remove from current stream</div>
+                    <div className="text-xs font-bold text-rose-200">Delete Message</div>
+                    <div className="text-[9px] text-rose-300/60 leading-none mt-0.5">Irreversibly remove from current stream</div>
                   </div>
                 </div>
-                <ChevronRight className="w-4 h-4 text-white/30" />
+                <ChevronRight className="w-4 h-4 text-rose-400/40" />
               </button>
             </div>
           </div>
@@ -7340,7 +7299,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
             Opening a new session from this message...
           </h3>
           <p className="text-xs text-white/70 text-center max-w-xs mt-2 font-medium leading-relaxed">
-            Duplicating world timeline, memories, character relationships & location status
+            Duplicating world timeline, memories & location status
           </p>
           <div className="mt-6 flex items-center gap-1.5">
             <div className="w-2 h-2 rounded-full bg-purple-400 animate-pulse" />
@@ -7602,8 +7561,10 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
               onStartChat={() => {
                 setShowWorldProfile(false);
               }}
-              onEdit={() => {
-                // Handle world edit if needed
+              onEdit={(w) => {
+                if (onEditWorld) {
+                  onEditWorld(w.id);
+                }
                 setShowWorldProfile(false);
               }}
               onToggleLike={(worldId) => {
@@ -8185,12 +8146,26 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                                 triggerHaptic();
                                 if (onUpdateConfig) {
                                   const updatedHistories = (storageConfig?.chatHistories || []).map(h => 
-                                    h.id === targetHistoryId ? { ...h, userPersonaId: up.id } : h
+                                    h.id === targetHistoryId ? {
+                                      ...h,
+                                      userPersonaId: up.id,
+                                      userPersonaName: up.name,
+                                      userPersonaAvatar: up.avatar,
+                                      userPersonaDesc: up.description
+                                    } : h
                                   );
                                   onUpdateConfig({ 
                                     activeUserPersonaId: up.id,
                                     chatHistories: updatedHistories
                                   });
+                                }
+                                if (targetHistoryId) {
+                                  saveUserPersonaToChat(targetHistoryId, {
+                                    id: up.id,
+                                    name: up.name,
+                                    avatar: up.avatar,
+                                    description: up.description
+                                  }).catch(() => {});
                                 }
                                 setCurrentPersonaName(up.name);
                                 setCurrentPersonaDesc(up.description || '');
@@ -8350,7 +8325,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                                       {(session as any)?.title || (session as any)?.worldName || `Session ${session?.id?.slice(-4)}`}
                                     </div>
                                     <div className="text-[10px] text-white/50 truncate">
-                                      {session?.lastMessage || `${msgCount} ${msgCount === 1 ? 'message' : 'messages'}`}
+                                      {renderCardPreviewText(getValidPreviewMessage(session), isLight)}
                                     </div>
                                   </div>
                                 </button>
@@ -8411,29 +8386,29 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
               initial={{ x: '100%' }}
               animate={{ x: 0 }}
               exit={{ x: '100%' }}
-              transition={{ duration: 0.12, ease: "easeOut" }}
-              className="absolute top-0 right-0 bottom-0 z-[150] w-[85%] max-w-xs sm:max-w-sm bg-[#0c0c0f] border-l border-white/[0.08] shadow-2xl flex flex-col text-white overflow-hidden font-sans select-text"
+              transition={{ duration: 0.15, ease: "easeOut" }}
+              className="absolute top-0 right-0 bottom-0 z-[150] w-[85vw] sm:w-[340px] max-w-[360px] bg-transparent backdrop-blur-3xl border-l border-white/[0.16] shadow-2xl flex flex-col text-white overflow-hidden overflow-x-hidden font-sans select-text touch-pan-y"
             >
               {/* Drawer Top Header */}
-              <div className="p-4 border-b border-white/[0.05] flex items-center justify-between shrink-0 bg-black/20">
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className="w-10 h-10 rounded-full overflow-hidden bg-white/10 border border-white/20 flex-shrink-0">
+              <div className="p-3.5 border-b border-white/[0.08] flex items-center justify-between shrink-0 bg-transparent backdrop-blur-xl gap-2">
+                <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                  <div className="w-9 h-9 rounded-full overflow-hidden bg-transparent border border-white/20 shrink-0">
                     {persona.avatar ? (
                       <SafeImage src={persona.avatar} alt={persona.name} className="w-full h-full object-cover" />
                     ) : (
-                      <div className="w-full h-full flex items-center justify-center font-bold text-sm bg-white/20 text-white">
+                      <div className="w-full h-full flex items-center justify-center font-bold text-xs bg-transparent border border-white/20 text-white">
                         {persona.name?.[0] || '?'}
                       </div>
                     )}
                   </div>
-                  <div className="min-w-0">
-                    <div className="text-sm font-bold text-white truncate flex items-center gap-1.5">
-                      <span>{persona.name}</span>
-                      <span className="text-[9px] font-extrabold uppercase tracking-wider px-1.5 py-0.5 rounded bg-white/10 text-white border border-white/20">
+                  <div className="min-w-0 flex-1">
+                    <div className="text-xs font-bold text-white flex flex-wrap items-center gap-1.5 leading-snug">
+                      <span className="break-words">{persona.name}</span>
+                      <span className="text-[8.5px] font-extrabold uppercase tracking-wider px-1.5 py-0.2 rounded bg-transparent text-white border border-white/20 shrink-0">
                         Status
                       </span>
                     </div>
-                    <div className="text-[11px] text-white/50 truncate">
+                    <div className="text-[10px] text-white/50 break-words whitespace-normal leading-tight mt-0.5">
                       {persona.tagline || (persona as any).role || linkedWorld?.name || "Active Session"}
                     </div>
                   </div>
@@ -8446,140 +8421,179 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       setShowAdminModal(true);
                     }}
                     title="Open Admin Stat Controls & Chat Repair"
-                    className="px-2.5 py-1 rounded-full bg-amber-500/20 hover:bg-amber-500/30 border border-amber-500/30 text-amber-300 font-bold text-[10px] flex items-center gap-1 cursor-pointer transition-all active:scale-95"
+                    className="px-2 py-1 rounded-full bg-transparent hover:bg-amber-500/20 border border-amber-500/40 text-amber-300 font-bold text-[9.5px] flex items-center gap-1 cursor-pointer transition-all active:scale-95 backdrop-blur-xl shadow-sm"
                   >
                     <span>⚡ Admin</span>
                   </button>
                   <button
                     type="button"
                     onClick={() => setIsDrawerOpen(false)}
-                    className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white/70 hover:text-white transition-colors cursor-pointer active:scale-95 shrink-0"
+                    className="w-7 h-7 rounded-full bg-transparent hover:bg-white/[0.08] border border-white/15 flex items-center justify-center text-white/80 hover:text-white transition-colors cursor-pointer active:scale-95 shrink-0 backdrop-blur-xl shadow-sm"
                   >
-                    <X className="w-4 h-4" />
+                    <X className="w-3.5 h-3.5" />
                   </button>
                 </div>
               </div>
 
               {/* Drawer Content */}
-              <div className="flex-1 overflow-y-auto px-4 pb-12 pt-4 space-y-4 custom-scrollbar">
-                {/* 1. CHARACTER STATUS */}
-                <div className="p-3.5 rounded-2xl bg-black/40 shadow-sm border border-white/[0.05] space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
-                      <Heart className="w-3.5 h-3.5 text-zinc-300" /> Character Status
-                    </span>
-                    <span className="text-[10px] text-white/50 font-mono truncate max-w-[120px]">
-                      {characterState?.currentActivity || characterState?.activity?.job || "Roleplaying"}
-                    </span>
+              <div className="flex-1 overflow-y-auto overflow-x-hidden px-3.5 pb-12 pt-3.5 space-y-3.5 custom-scrollbar w-full min-w-0">
+                {/* 1. REBUILT CHARACTER STATUS SYSTEM */}
+                <div className="p-3.5 rounded-2xl bg-transparent backdrop-blur-2xl border border-white/[0.15] shadow-xl space-y-3 w-full min-w-0 overflow-hidden">
+                  <div className="flex flex-col gap-1.5 min-w-0">
+                    <div className="flex items-center justify-between min-w-0 gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <div className="w-5 h-5 rounded-md bg-transparent border border-emerald-500/40 flex items-center justify-center text-emerald-400 text-xs shrink-0">
+                          ❤️
+                        </div>
+                        <div className="min-w-0">
+                          <span className="text-xs font-bold text-white tracking-wide block leading-none">Character Vitals</span>
+                          <span className="text-[9.5px] text-emerald-400 font-medium">Stable & Realistic</span>
+                        </div>
+                      </div>
+                    </div>
+                    <div className="pt-0.5">
+                      <span className="inline-block text-[9.5px] text-white/80 font-mono break-words whitespace-normal leading-tight bg-transparent px-2 py-0.5 rounded-md border border-white/[0.15] max-w-full backdrop-blur-xl">
+                        Activity: {characterState?.currentActivity || characterState?.activity?.job || "Active"}
+                      </span>
+                    </div>
                   </div>
 
-                  {/* Stat Vitals */}
-                  <div className="space-y-2 pt-1">
+                  {/* Stat Vitals Grid */}
+                  <div className="space-y-2 pt-0.5 w-full min-w-0">
                     {[
-                      { label: 'Health', key: 'health', defaultVal: 100 },
-                      { label: 'Energy', key: 'energy', defaultVal: 85 },
-                      { label: 'Mood', key: 'mood', defaultVal: 80 },
-                      { label: 'Hunger', key: 'hunger', defaultVal: 90 },
-                      { label: 'Thirst', key: 'thirst', defaultVal: 85 },
-                      { label: 'Hygiene', key: 'hygiene', defaultVal: 95 },
+                      { label: 'Energy', key: 'energy', icon: '⚡', color: 'from-amber-500 to-yellow-400', defaultVal: 90 },
+                      { label: 'Health', key: 'health', icon: '❤️', color: 'from-emerald-500 to-teal-400', defaultVal: 100 },
+                      { label: 'Mood', key: 'mood', icon: '😊', color: 'from-violet-500 to-purple-400', defaultVal: 85 },
+                      { label: 'Hunger', key: 'hunger', icon: '🍗', color: 'from-orange-500 to-amber-400', defaultVal: 90 },
+                      { label: 'Thirst', key: 'thirst', icon: '💧', color: 'from-sky-500 to-blue-400', defaultVal: 90 },
+                      { label: 'Hygiene', key: 'hygiene', icon: '🧼', color: 'from-teal-500 to-emerald-400', defaultVal: 95 },
                     ].map(stat => {
                       const rawVal = characterState?.status?.[stat.key] ?? characterState?.[stat.key] ?? stat.defaultVal;
-                      const numVal = typeof rawVal === 'number' ? rawVal : parseInt(String(rawVal)) || 100;
+                      const numVal = Math.min(100, Math.max(45, typeof rawVal === 'number' ? rawVal : parseInt(String(rawVal)) || 90));
+                      const getTier = (v: number) => {
+                        if (v >= 85) return { text: 'Optimal', badge: 'text-emerald-400 bg-transparent border-emerald-500/30' };
+                        if (v >= 65) return { text: 'Good', badge: 'text-sky-400 bg-transparent border-sky-500/30' };
+                        if (v >= 50) return { text: 'Normal', badge: 'text-amber-400 bg-transparent border-amber-500/30' };
+                        return { text: 'Fair', badge: 'text-orange-400 bg-transparent border-orange-500/30' };
+                      };
+                      const tier = getTier(numVal);
+
                       return (
                         <div 
                           key={stat.key} 
-                          className="flex items-center gap-3 py-1.5 px-1.5 hover:bg-white/5 rounded-xl border border-transparent hover:border-white/5 transition-all group"
-                          title={`Adjust ${stat.label}`}
+                          className="p-2 bg-transparent hover:bg-white/[0.04] rounded-xl border border-white/[0.12] backdrop-blur-xl transition-all w-full min-w-0 shadow-sm"
                         >
-                          <div className="flex-1 space-y-1">
-                            <div className="flex justify-between items-center text-xs">
-                              <span 
-                                className="text-white/60 font-medium group-hover:text-white transition-colors cursor-pointer"
+                          <div className="flex items-center justify-between text-xs mb-1.5 min-w-0 gap-1.5">
+                            <div className="flex items-center gap-1.5 min-w-0 flex-1 flex-wrap">
+                              <span className="text-xs shrink-0">{stat.icon}</span>
+                              <span className="font-semibold text-white/90 text-xs break-words">{stat.label}</span>
+                              <span className={`text-[8px] px-1 py-0.2 rounded border font-medium ${tier.badge} shrink-0`}>
+                                {tier.text}
+                              </span>
+                            </div>
+                            <div className="flex items-center gap-1.5 shrink-0">
+                              <span className="font-mono font-bold text-white text-xs">{numVal}%</span>
+                              <button
+                                type="button"
                                 onClick={() => {
                                   triggerHaptic();
-                                  setShowAdminModal(true);
+                                  const boosted = Math.min(100, numVal + 20);
+                                  handleUpdateCharacterState('status', stat.key, boosted);
+                                  triggerToast(`+20% ${stat.label} restored! (${boosted}%)`);
                                 }}
+                                className="w-5 h-5 rounded-md bg-transparent hover:bg-white/[0.08] border border-white/[0.18] text-white flex items-center justify-center text-xs transition-colors cursor-pointer active:scale-90 backdrop-blur-xl shadow-sm"
+                                title={`Restore +20% ${stat.label}`}
                               >
-                                {stat.label} <span className="text-[8px] text-white/30 font-light opacity-0 group-hover:opacity-100 transition-opacity">(Adjust)</span>
-                              </span>
-                              <span className="text-white font-mono font-semibold">{numVal}%</span>
-                            </div>
-                            <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
-                              <div className={`h-full bg-white transition-all duration-300`} style={{ width: `${Math.min(100, Math.max(0, numVal))}%` }} />
+                                <Plus className="w-3 h-3" />
+                              </button>
                             </div>
                           </div>
-                          
-                          <button
-                            type="button"
-                            onClick={() => {
-                              triggerHaptic();
-                              setRestoreStatusModal({
-                                statKey: stat.key,
-                                statLabel: stat.label,
-                                currentVal: numVal
-                              });
-                            }}
-                            className="w-7 h-7 rounded-full bg-white/10 hover:bg-white/20 flex items-center justify-center text-white cursor-pointer transition-colors active:scale-95 flex-shrink-0"
-                            title="Restore 20% (10 Orbs)"
-                          >
-                            <Plus className="w-4 h-4" />
-                          </button>
+                          <div className="w-full h-1.5 bg-white/10 rounded-full overflow-hidden">
+                            <div 
+                              className={`h-full bg-gradient-to-r ${stat.color} transition-all duration-300 rounded-full`} 
+                              style={{ width: `${numVal}%` }} 
+                            />
+                          </div>
                         </div>
                       );
                     })}
                   </div>
+
+                  {/* Quick Status Action Controls */}
+                  <div className="pt-2 border-t border-white/10 flex flex-col gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        triggerHaptic();
+                        const curEnergy = characterState?.status?.energy ?? 90;
+                        const boosted = Math.min(100, (typeof curEnergy === 'number' ? curEnergy : 90) + 30);
+                        handleUpdateCharacterState('status', 'energy', boosted);
+                        triggerToast(`⚡ Energy boosted to ${boosted}%!`);
+                      }}
+                      className="w-full py-2 px-3 rounded-xl bg-transparent hover:bg-amber-500/20 border border-amber-500/40 text-amber-200 font-bold text-[11px] flex items-center justify-center gap-1.5 transition-all cursor-pointer active:scale-95 backdrop-blur-xl shadow-sm"
+                    >
+                      <span>⚡ +30% Energy Boost</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleBatchRestoreAllStatus}
+                      className="w-full py-2 px-3 rounded-xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.18] text-white font-bold text-[11px] flex items-center justify-center gap-1.5 transition-all cursor-pointer active:scale-95 backdrop-blur-xl shadow-sm"
+                    >
+                      <span>🌟 Restore All Vitals (100%)</span>
+                    </button>
+                  </div>
                 </div>
 
                 {/* LONG-TERM SITUATIONS */}
-                <div className="p-3.5 rounded-2xl bg-black/40 shadow-sm border border-white/[0.05] space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
+                <div className="p-3.5 rounded-2xl bg-transparent backdrop-blur-2xl border border-white/[0.15] shadow-xl space-y-3 w-full min-w-0 overflow-hidden">
+                  <div className="flex items-center justify-between min-w-0 gap-2">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5 shrink-0">
                       <Activity className="w-3.5 h-3.5 text-zinc-300" /> Long-Term Situations
                     </span>
-                    <span className="text-[10px] text-zinc-400 font-bold uppercase">Active</span>
+                    <span className="text-[10px] text-zinc-400 font-bold uppercase shrink-0">Active</span>
                   </div>
 
                   {(!characterState?.longterm || characterState.longterm.length === 0) ? (
-                    <div className="text-center py-4 bg-white/[0.02] rounded-xl border border-dashed border-white/10 px-2">
-                      <p className="text-[10px] text-zinc-400 leading-relaxed">
+                    <div className="text-center py-4 bg-transparent rounded-xl border border-dashed border-white/15 px-3 w-full min-w-0">
+                      <p className="text-[10px] text-zinc-400 leading-relaxed break-words whitespace-normal">
                         No active long-term conditions. Intimacy choices, exhaustion, or storyline developments will trigger lasting status effects here.
                       </p>
                     </div>
                   ) : (
-                    <div className="space-y-2">
+                    <div className="space-y-2 w-full min-w-0">
                       {characterState.longterm.map((sit: any, idx: number) => {
                         return (
-                          <div key={idx} className="bg-white/[0.03] hover:bg-white/[0.06] p-3 rounded-xl border border-white/10 transition-all space-y-1.5 group relative">
-                            <div className="flex items-start justify-between gap-2">
-                              <span className="font-semibold text-xs text-white leading-tight">{sit.title}</span>
-                              <div className="flex gap-1 items-center flex-shrink-0">
-                                <span className="text-[9px] px-1.5 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700 font-medium">
+                          <div key={idx} className="bg-transparent hover:bg-white/[0.04] p-3 rounded-xl border border-white/[0.12] backdrop-blur-xl transition-all space-y-2 group relative w-full min-w-0 overflow-hidden shadow-sm">
+                            <div className="flex flex-col gap-1.5 min-w-0">
+                              <span className="font-semibold text-xs text-white leading-snug break-words whitespace-normal">{sit.title}</span>
+                              <div className="flex flex-wrap gap-1 items-center">
+                                <span className="text-[8.5px] px-1.5 py-0.5 rounded bg-transparent text-zinc-300 border border-white/20 font-medium whitespace-nowrap">
                                   {sit.type || 'condition'}
                                 </span>
                                 {sit.severity && sit.severity !== 'N/A' && (
-                                  <span className="text-[9px] bg-zinc-800 text-zinc-200 border border-zinc-700 px-1.5 py-0.5 rounded font-bold">
+                                  <span className="text-[8.5px] bg-transparent text-zinc-200 border border-white/20 px-1.5 py-0.5 rounded font-bold whitespace-nowrap">
                                     {sit.severity}
                                   </span>
                                 )}
                               </div>
                             </div>
                             {sit.description && (
-                              <p className="text-[10px] text-zinc-400 leading-relaxed line-clamp-2">{sit.description}</p>
+                              <p className="text-[10px] text-zinc-400 leading-relaxed break-words whitespace-normal">{sit.description}</p>
                             )}
-                            <div className="flex items-center justify-between pt-1 border-t border-white/5 text-[9px] text-zinc-400">
-                              <span>Duration: {sit.duration || 'Ongoing'}</span>
-                              <div className="flex items-center gap-1.5">
+                            <div className="flex flex-col sm:flex-row sm:items-center justify-between pt-1.5 border-t border-white/5 text-[9px] text-zinc-400 min-w-0 gap-1.5">
+                              <span className="break-words whitespace-normal leading-tight">Duration: {sit.duration || 'Ongoing'}</span>
+                              <div className="flex items-center gap-1.5 shrink-0 self-end sm:self-auto">
                                 <button
                                   type="button"
                                   onClick={() => openSituationModal(sit, idx)}
-                                  className="text-zinc-300 hover:text-white font-medium px-1.5 py-0.5 rounded hover:bg-white/10 transition-all cursor-pointer"
+                                  className="text-white/80 hover:text-white font-medium px-2 py-0.5 rounded-lg bg-transparent hover:bg-white/[0.08] border border-white/[0.14] backdrop-blur-xl transition-all cursor-pointer"
                                 >
                                   Edit
                                 </button>
                                 <button
                                   type="button"
                                   onClick={() => handleDeleteSituation(idx)}
-                                  className="text-zinc-400 hover:text-white font-medium px-1.5 py-0.5 rounded hover:bg-white/10 transition-all cursor-pointer"
+                                  className="text-white/60 hover:text-white font-medium px-2 py-0.5 rounded-lg bg-transparent hover:bg-white/[0.08] border border-white/[0.14] backdrop-blur-xl transition-all cursor-pointer"
                                 >
                                   Dismiss
                                 </button>
@@ -8594,7 +8608,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                   <button 
                     type="button"
                     onClick={() => openSituationModal()}
-                    className="w-full py-2 rounded-xl bg-white/10 hover:bg-white/15 text-xs text-white font-bold transition-all border border-white/10 cursor-pointer active:scale-95 flex items-center justify-center gap-1.5"
+                    className="w-full py-2 rounded-xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] text-xs text-white font-bold transition-all border border-white/[0.16] backdrop-blur-xl cursor-pointer active:scale-95 flex items-center justify-center gap-1.5 shadow-sm"
                   >
                     <Plus className="w-3.5 h-3.5" />
                     <span>Add Long-Term Situation</span>
@@ -8602,27 +8616,27 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                 </div>
 
                 {/* PREGNANCY & FERTILITY MONITOR */}
-                <div className="p-3.5 rounded-2xl bg-black/40 shadow-sm border border-white/[0.05] space-y-3">
-                  <div className="flex items-center justify-between">
-                    <div className="flex items-center gap-1.5">
-                      <Heart className="w-3.5 h-3.5 text-zinc-300" />
+                <div className="p-3.5 rounded-2xl bg-transparent backdrop-blur-2xl border border-white/[0.15] shadow-xl space-y-3 w-full min-w-0 overflow-hidden">
+                  <div className="flex items-center justify-between gap-1.5 flex-wrap">
+                    <div className="flex items-center gap-1.5 min-w-0">
+                      <Heart className="w-3.5 h-3.5 text-zinc-300 shrink-0" />
                       <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300">Pregnancy & Fertility</span>
                     </div>
-                    <span className="text-[9px] bg-zinc-800 text-zinc-200 px-2 py-0.5 rounded-full border border-zinc-700 font-semibold uppercase">
+                    <span className="text-[9px] bg-transparent text-zinc-200 px-2 py-0.5 rounded-full border border-white/20 font-semibold uppercase shrink-0">
                       {characterState?.pregnancy?.status || "Not Pregnant"}
                     </span>
                   </div>
 
-                  <div className="grid grid-cols-2 gap-2 text-[11px]">
-                    <div className="bg-white/5 p-2 rounded-xl border border-white/5">
+                  <div className="grid grid-cols-1 gap-2 text-[11px] w-full min-w-0">
+                    <div className="bg-transparent p-2 rounded-xl border border-white/10 min-w-0">
                       <span className="text-zinc-400 text-[9px] block font-medium">Gestation</span>
-                      <div className="text-white font-semibold">
+                      <div className="text-white font-semibold break-words whitespace-normal">
                         {characterState?.pregnancy?.weeks ? `${characterState.pregnancy.weeks} Weeks` : '0 Weeks (N/A)'}
                       </div>
                     </div>
-                    <div className="bg-white/5 p-2 rounded-xl border border-white/5">
+                    <div className="bg-transparent p-2 rounded-xl border border-white/10 min-w-0">
                       <span className="text-zinc-400 text-[9px] block font-medium">Father / Partner</span>
-                      <div className="text-white font-semibold truncate">
+                      <div className="text-white font-semibold break-words whitespace-normal leading-snug">
                         {characterState?.pregnancy?.father || 'None'}
                       </div>
                     </div>
@@ -8633,7 +8647,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       <span className="text-zinc-400 text-[9px] block font-medium">Symptoms</span>
                       <div className="flex flex-wrap gap-1">
                         {characterState.pregnancy.symptoms.map((symptom: string, idx: number) => (
-                          <span key={idx} className="text-[9px] px-2 py-0.5 bg-zinc-800 border border-zinc-700 text-zinc-200 rounded-md">
+                          <span key={idx} className="text-[9px] px-2 py-0.5 bg-transparent border border-white/20 text-zinc-200 rounded-md break-words whitespace-normal">
                             {symptom}
                           </span>
                         ))}
@@ -8641,15 +8655,15 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     </div>
                   )}
 
-                  <div className="flex items-center justify-between text-[10px] bg-white/5 p-2 rounded-xl border border-white/5">
-                    <span className="text-zinc-400 font-medium">Protection Used:</span>
-                    <span className="text-white font-semibold">{characterState?.pregnancy?.protectionUsed || 'None'}</span>
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between text-[10px] bg-transparent p-2 rounded-xl border border-white/10 gap-1 min-w-0">
+                    <span className="text-zinc-400 font-medium shrink-0">Protection Used:</span>
+                    <span className="text-white font-semibold break-words whitespace-normal">{characterState?.pregnancy?.protectionUsed || 'None'}</span>
                   </div>
 
                   <button
                     type="button"
                     onClick={openPregnancyModal}
-                    className="w-full py-2 rounded-xl bg-white hover:bg-zinc-200 text-black font-bold text-xs transition-all shadow-sm cursor-pointer active:scale-95 flex items-center justify-center gap-1.5"
+                    className="w-full py-2 rounded-xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] text-white font-bold text-xs transition-all border border-white/[0.18] backdrop-blur-xl shadow-sm cursor-pointer active:scale-95 flex items-center justify-center gap-1.5"
                   >
                     <Sliders className="w-3.5 h-3.5" />
                     <span>Adjust Pregnancy Settings</span>
@@ -8657,43 +8671,43 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                 </div>
 
                 {/* 2. INVENTORY & MONEY */}
-                <div className="p-3.5 rounded-2xl bg-black/40 shadow-sm border border-white/[0.05] space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
+                <div className="p-3.5 rounded-2xl bg-transparent backdrop-blur-2xl border border-white/[0.15] shadow-xl space-y-3 w-full min-w-0 overflow-hidden">
+                  <div className="flex items-center justify-between gap-2 min-w-0">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5 shrink-0">
                       <Package className="w-3.5 h-3.5 text-zinc-300" /> Inventory & Money
                     </span>
                     <button
                       type="button"
                       onClick={openMoneyModal}
-                      className="text-[10px] text-zinc-400 hover:text-white font-bold underline cursor-pointer"
+                      className="text-[10px] text-zinc-400 hover:text-white font-bold underline cursor-pointer shrink-0"
                     >
                       Edit Wallet
                     </button>
                   </div>
 
                   {/* Money Card */}
-                  <div className="p-2.5 rounded-xl bg-white/5 border border-white/10 flex items-center justify-between">
-                    <div className="flex items-center gap-2">
-                      <div className="w-7 h-7 rounded-lg bg-zinc-800 border border-zinc-700 flex items-center justify-center text-white font-bold text-xs">
+                  <div className="p-2.5 rounded-xl bg-transparent border border-white/15 flex items-center justify-between gap-2 min-w-0 backdrop-blur-xl">
+                    <div className="flex items-center gap-2 min-w-0">
+                      <div className="w-7 h-7 rounded-lg bg-transparent border border-white/20 flex items-center justify-center text-white font-bold text-xs shrink-0">
                         $
                       </div>
-                      <span className="text-xs text-zinc-300 font-medium">Money / Wallet</span>
+                      <span className="text-xs text-zinc-300 font-medium truncate">Money / Wallet</span>
                     </div>
-                    <span className="text-sm font-bold text-white font-mono">
+                    <span className="text-sm font-bold text-white font-mono shrink-0">
                       ${characterState?.inventory?.money ?? characterState?.credits ?? 250}
                     </span>
                   </div>
 
                   {/* Inventory Items on Person */}
-                  <div className="space-y-2">
-                    <div className="flex items-center justify-between">
+                  <div className="space-y-2 w-full min-w-0">
+                    <div className="flex items-center justify-between min-w-0 gap-2">
                       <span className="text-[10px] text-zinc-400 font-bold uppercase tracking-wider">Items on Person</span>
-                      <span className="text-[10px] text-zinc-500 font-mono">
+                      <span className="text-[10px] text-zinc-500 font-mono shrink-0">
                         {(characterState?.inventory?.items || ['Smartphone', 'House Keys', 'Student ID']).length} items
                       </span>
                     </div>
 
-                    <div className="space-y-1.5">
+                    <div className="space-y-1.5 w-full min-w-0">
                       {(characterState?.inventory?.items || ['Smartphone', 'House Keys', 'Student ID']).map((rawItem: any, i: number) => {
                         const item = typeof rawItem === 'string'
                           ? { name: rawItem, location: 'On Person', quantity: 1, equipped: false, description: '' }
@@ -8702,24 +8716,24 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                         return (
                           <div 
                             key={i} 
-                            className="bg-white/5 hover:bg-white/10 p-2.5 rounded-xl border border-white/5 transition-all flex items-center justify-between gap-2 group cursor-pointer"
+                            className="bg-transparent hover:bg-white/[0.04] p-2.5 rounded-xl border border-white/10 transition-all flex items-start justify-between gap-2 group cursor-pointer w-full min-w-0 overflow-hidden backdrop-blur-xl"
                             onClick={() => openItemModal(item, i)}
                           >
-                            <div className="min-w-0 flex-1">
-                              <div className="flex items-center gap-1.5">
-                                <span className="text-xs font-semibold text-white truncate">{item.name || 'Unnamed Item'}</span>
+                            <div className="min-w-0 flex-1 space-y-1">
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                <span className="text-xs font-semibold text-white break-words whitespace-normal leading-snug">{item.name || 'Unnamed Item'}</span>
                                 {item.quantity && item.quantity > 1 && (
-                                  <span className="text-[9px] bg-zinc-800 text-zinc-300 border border-zinc-700 px-1.5 py-0.2 rounded font-mono font-bold">
+                                  <span className="text-[9px] bg-transparent text-zinc-300 border border-white/20 px-1.5 py-0.2 rounded font-mono font-bold shrink-0">
                                     x{item.quantity}
                                   </span>
                                 )}
                                 {item.equipped && (
-                                  <span className="text-[8px] bg-white text-black font-extrabold px-1.5 py-0.2 rounded uppercase">
+                                  <span className="text-[8px] bg-white text-black font-extrabold px-1.5 py-0.2 rounded uppercase shrink-0">
                                     Equipped
                                   </span>
                                 )}
                               </div>
-                              <div className="text-[10px] text-zinc-400 truncate mt-0.5">
+                              <div className="text-[10px] text-zinc-400 break-words whitespace-normal leading-normal">
                                 <span>{item.location || 'On Person'}</span>
                                 {item.description && <span className="text-zinc-500"> — {item.description}</span>}
                               </div>
@@ -8730,7 +8744,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                                 e.stopPropagation();
                                 handleDeleteItem(i);
                               }}
-                              className="text-zinc-500 hover:text-white p-1 rounded hover:bg-white/10 transition-colors"
+                              className="text-zinc-500 hover:text-white p-1 rounded hover:bg-white/10 transition-colors shrink-0"
                               title="Remove item"
                             >
                               <X className="w-3.5 h-3.5" />
@@ -8743,7 +8757,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     <button
                       type="button"
                       onClick={() => openItemModal()}
-                      className="w-full py-2 rounded-xl bg-white/10 hover:bg-white/15 text-xs text-white font-bold transition-all border border-white/10 cursor-pointer active:scale-95 flex items-center justify-center gap-1.5 mt-2"
+                      className="w-full py-2 rounded-xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] text-xs text-white font-bold transition-all border border-white/[0.16] backdrop-blur-xl cursor-pointer active:scale-95 flex items-center justify-center gap-1.5 mt-2 shadow-sm"
                     >
                       <Plus className="w-3.5 h-3.5" />
                       <span>Add Item on Person</span>
@@ -8752,15 +8766,15 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                 </div>
 
                 {/* 3. CURRENT LOCATION */}
-                <div className="p-3.5 rounded-2xl bg-black/40 shadow-sm border border-white/[0.05] space-y-2.5">
+                <div className="p-3.5 rounded-2xl bg-transparent backdrop-blur-2xl border border-white/[0.15] shadow-xl space-y-2.5 w-full min-w-0 overflow-hidden">
                   <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
-                    <MapPin className="w-3.5 h-3.5 text-zinc-300" /> Current Location
+                    <MapPin className="w-3.5 h-3.5 text-zinc-300 shrink-0" /> Current Location
                   </span>
                   {currentPlace?.image && (
                     <div className="w-full h-24 rounded-xl overflow-hidden border border-white/10 relative">
                       <SafeImage src={currentPlace.image} alt={worldLocationInput} className="w-full h-full object-cover" />
                       <div className="absolute inset-0 bg-gradient-to-t from-black/80 via-black/20 to-transparent flex items-end p-2">
-                        <span className="text-xs font-bold text-white drop-shadow">{currentPlace.name}</span>
+                        <span className="text-xs font-bold text-white drop-shadow break-words whitespace-normal leading-tight">{currentPlace.name}</span>
                       </div>
                     </div>
                   )}
@@ -8775,14 +8789,14 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       }
                     }}
                     placeholder="Current Location..."
-                    className="w-full bg-white/10 border border-white/15 rounded-xl px-3 py-2 text-xs text-white placeholder-white/30 focus:outline-none focus:border-white/50"
+                    className="w-full bg-transparent border border-white/[0.16] rounded-xl px-3 py-2 text-xs text-white placeholder-white/40 focus:outline-none focus:border-white/50 backdrop-blur-xl hover:bg-white/[0.04]"
                   />
                 </div>
 
                 {/* 4. TIME PERIOD */}
-                <div className="p-3.5 rounded-2xl bg-black/40 shadow-sm border border-white/[0.05] space-y-2.5">
+                <div className="p-3.5 rounded-2xl bg-transparent backdrop-blur-2xl border border-white/[0.15] shadow-xl space-y-2.5 w-full min-w-0 overflow-hidden">
                   <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
-                    <Clock className="w-3.5 h-3.5 text-zinc-300" /> Time Period
+                    <Clock className="w-3.5 h-3.5 text-zinc-300 shrink-0" /> Time Period
                   </span>
                   <OptimizedInput
                     type="text"
@@ -8798,14 +8812,14 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       }
                     }}
                     placeholder="e.g. August 15, 2026 - Afternoon"
-                    className="w-full bg-white/10 border border-white/15 rounded-xl px-3 py-2 text-xs text-white placeholder-white/30 focus:outline-none focus:border-white/50"
+                    className="w-full bg-transparent border border-white/[0.16] rounded-xl px-3 py-2 text-xs text-white placeholder-white/40 focus:outline-none focus:border-white/50 backdrop-blur-xl hover:bg-white/[0.04]"
                   />
                 </div>
 
                 {/* 5. WEATHER & ATMOSPHERE */}
-                <div className="p-3.5 rounded-2xl bg-black/40 shadow-sm border border-white/[0.05] space-y-2.5">
+                <div className="p-3.5 rounded-2xl bg-transparent backdrop-blur-2xl border border-white/[0.15] shadow-xl space-y-2.5 w-full min-w-0 overflow-hidden">
                   <span className="text-[10px] font-bold uppercase tracking-wider text-zinc-300 flex items-center gap-1.5">
-                    <CloudSun className="w-3.5 h-3.5 text-zinc-300" /> Weather & Atmosphere
+                    <CloudSun className="w-3.5 h-3.5 text-zinc-300 shrink-0" /> Weather & Atmosphere
                   </span>
                   <OptimizedInput
                     type="text"
@@ -8821,14 +8835,14 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                       }
                     }}
                     placeholder="e.g. Clear skies, gentle breeze"
-                    className="w-full bg-white/10 border border-white/15 rounded-xl px-3 py-2 text-xs text-white placeholder-white/30 focus:outline-none focus:border-white/50"
+                    className="w-full bg-transparent border border-white/[0.16] rounded-xl px-3 py-2 text-xs text-white placeholder-white/40 focus:outline-none focus:border-white/50 backdrop-blur-xl hover:bg-white/[0.04]"
                   />
                 </div>
 
               </div>
 
               {/* Drawer Footer */}
-              <div className="p-3.5 border-t border-white/10 bg-white/[0.02] backdrop-blur-md">
+              <div className="p-3.5 border-t border-white/[0.08] bg-transparent backdrop-blur-xl">
                 <button
                   type="button"
                   onClick={() => {
@@ -8837,7 +8851,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
                     setShowBottomSheet(true);
                     setWorldTabSection('grid');
                   }}
-                  className="w-full py-2.5 rounded-xl bg-white/10 hover:bg-white/15 border border-white/15 text-white text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-[0.98]"
+                  className="w-full py-2.5 rounded-xl bg-transparent hover:bg-white/[0.08] active:bg-white/[0.14] border border-white/[0.16] text-white text-xs font-bold transition-all flex items-center justify-center gap-2 cursor-pointer active:scale-[0.98] backdrop-blur-xl shadow-sm"
                 >
                   <Sliders className="w-4 h-4 text-white" />
                   <span>Open Roleplay Menu</span>
@@ -8987,6 +9001,7 @@ export const PremiumChatScreen: React.FC<PremiumChatScreenProps> = ({
 };
 
 interface IsolatedChatInputProps {
+  sessionId?: string;
   characterName: string;
   isLight: boolean;
   isStreaming: boolean;
@@ -9005,6 +9020,7 @@ interface IsolatedChatInputProps {
 }
 
 const IsolatedChatInput: React.FC<IsolatedChatInputProps> = React.memo(({
+  sessionId,
   characterName,
   isLight,
   isStreaming,
@@ -9021,9 +9037,18 @@ const IsolatedChatInput: React.FC<IsolatedChatInputProps> = React.memo(({
   externalText,
   onExternalTextConsumed,
 }) => {
-  const [text, setText] = useState('');
+  const [text, setText] = useState(() => (sessionId ? loadSessionDraft(sessionId) : ''));
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const currentSessionIdRef = useRef<string | undefined>(sessionId);
+
+  // When switching sessions, save previous session's draft and load the incoming session's draft
+  useEffect(() => {
+    currentSessionIdRef.current = sessionId;
+    const loaded = sessionId ? loadSessionDraft(sessionId) : '';
+    setText(loaded);
+    adjustHeight(loaded);
+  }, [sessionId]);
 
   const handleFileChange = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -9072,6 +9097,9 @@ const IsolatedChatInput: React.FC<IsolatedChatInputProps> = React.memo(({
       setText(prev => {
         const next = prev ? prev + externalText : externalText;
         adjustHeight(next);
+        if (currentSessionIdRef.current) {
+          saveSessionDraft(currentSessionIdRef.current, next);
+        }
         return next;
       });
       if (onExternalTextConsumed) onExternalTextConsumed();
@@ -9082,13 +9110,19 @@ const IsolatedChatInput: React.FC<IsolatedChatInputProps> = React.memo(({
     const val = e.target.value;
     setText(val);
     adjustHeight(val);
+    if (currentSessionIdRef.current) {
+      saveSessionDraft(currentSessionIdRef.current, val);
+    }
   };
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!text.trim() || isStreaming) return;
+    if (!text.trim() && !selectedImage) return;
     const sentText = text;
     setText('');
+    if (currentSessionIdRef.current) {
+      clearSessionDraft(currentSessionIdRef.current);
+    }
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
       (textareaRef.current as any)._lastLen = 0;
@@ -9097,17 +9131,129 @@ const IsolatedChatInput: React.FC<IsolatedChatInputProps> = React.memo(({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    const el = textareaRef.current;
     const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || (typeof navigator !== 'undefined' && navigator.maxTouchPoints > 0);
+
     if (e.key === 'Enter' && !e.shiftKey && !isMobile) {
       if (!e.nativeEvent.isComposing) {
         e.preventDefault();
         handleSubmit(e);
+        return;
+      }
+    }
+
+    // Auto-pair asterisks (* -> *|* or ** -> **|**), quotation marks (" -> "|"), and brackets ([ -> [|])
+    if (el && (e.key === '*' || e.key === '"' || e.key === '“' || e.key === '”' || e.key === '[')) {
+      const keyChar = (e.key === '“' || e.key === '”') ? '"' : e.key;
+      const start = el.selectionStart;
+      const end = el.selectionEnd;
+
+      if (start !== null && end !== null) {
+        // If user highlighted text, wrap selection
+        if (start !== end) {
+          e.preventDefault();
+          const selectedText = text.substring(start, end);
+          const leftChar = keyChar === '*' ? '*' : keyChar === '[' ? '[' : '"';
+          const rightChar = keyChar === '*' ? '*' : keyChar === '[' ? ']' : '"';
+          const newText = text.substring(0, start) + leftChar + selectedText + rightChar + text.substring(end);
+          setText(newText);
+          adjustHeight(newText);
+          if (currentSessionIdRef.current) saveSessionDraft(currentSessionIdRef.current, newText);
+          requestAnimationFrame(() => {
+            el.setSelectionRange(start + 1, end + 1);
+          });
+          return;
+        }
+
+        // Single cursor position
+        if (keyChar === '*') {
+          e.preventDefault();
+          const charBefore = text.substring(start - 1, start);
+          const charAfter = text.substring(start, start + 1);
+
+          if (charBefore === '*' && charAfter === '*') {
+            // Currently at *|* -> User types * again -> becomes **|**
+            const newText = text.substring(0, start) + '*' + '*' + text.substring(start);
+            setText(newText);
+            adjustHeight(newText);
+            if (currentSessionIdRef.current) saveSessionDraft(currentSessionIdRef.current, newText);
+            requestAnimationFrame(() => {
+              el.setSelectionRange(start + 1, start + 1);
+            });
+          } else if (charAfter === '*') {
+            // Cursor is right before a star e.g. |* -> step over to *|
+            requestAnimationFrame(() => {
+              el.setSelectionRange(start + 1, start + 1);
+            });
+          } else {
+            // Typing * -> insert ** and place cursor in middle (*|*)
+            const newText = text.substring(0, start) + '**' + text.substring(start);
+            setText(newText);
+            adjustHeight(newText);
+            if (currentSessionIdRef.current) saveSessionDraft(currentSessionIdRef.current, newText);
+            requestAnimationFrame(() => {
+              el.setSelectionRange(start + 1, start + 1);
+            });
+          }
+        } else if (keyChar === '"') {
+          e.preventDefault();
+          const charBefore = text.substring(start - 1, start);
+          const charAfter = text.substring(start, start + 1);
+
+          if (charBefore === '"' && charAfter === '"') {
+            requestAnimationFrame(() => {
+              el.setSelectionRange(start + 1, start + 1);
+            });
+          } else if (charAfter === '"') {
+            requestAnimationFrame(() => {
+              el.setSelectionRange(start + 1, start + 1);
+            });
+          } else {
+            // Typing " -> insert "" and place cursor in middle ("|")
+            const newText = text.substring(0, start) + '""' + text.substring(start);
+            setText(newText);
+            adjustHeight(newText);
+            if (currentSessionIdRef.current) saveSessionDraft(currentSessionIdRef.current, newText);
+            requestAnimationFrame(() => {
+              el.setSelectionRange(start + 1, start + 1);
+            });
+          }
+        } else if (keyChar === '[') {
+          e.preventDefault();
+          const newText = text.substring(0, start) + '[]' + text.substring(start);
+          setText(newText);
+          adjustHeight(newText);
+          if (currentSessionIdRef.current) saveSessionDraft(currentSessionIdRef.current, newText);
+          requestAnimationFrame(() => {
+            el.setSelectionRange(start + 1, start + 1);
+          });
+        }
+      }
+    }
+
+    // Smart Backspace: when backspacing inside empty pair e.g. *|* or "|", delete both characters
+    if (e.key === 'Backspace' && el) {
+      const start = el.selectionStart;
+      const end = el.selectionEnd;
+      if (start === end && start > 0) {
+        const charBefore = text.substring(start - 1, start);
+        const charAfter = text.substring(start, start + 1);
+        if ((charBefore === '*' && charAfter === '*') || (charBefore === '"' && charAfter === '"') || (charBefore === '[' && charAfter === ']')) {
+          e.preventDefault();
+          const newText = text.substring(0, start - 1) + text.substring(start + 1);
+          setText(newText);
+          adjustHeight(newText);
+          if (currentSessionIdRef.current) saveSessionDraft(currentSessionIdRef.current, newText);
+          requestAnimationFrame(() => {
+            el.setSelectionRange(start - 1, start - 1);
+          });
+        }
       }
     }
   };
 
   return (
-    <form onSubmit={handleSubmit} className="w-full flex items-end gap-2.5">
+    <form onSubmit={handleSubmit} className="w-full min-w-0 flex items-end gap-2">
       <input
         type="file"
         ref={fileInputRef}
@@ -9115,13 +9261,11 @@ const IsolatedChatInput: React.FC<IsolatedChatInputProps> = React.memo(({
         accept="image/*"
         className="hidden"
       />
-      {/* Main Input Pill Capsule */}
-      <div className={`flex-1 flex items-center rounded-[22px] shadow-sm transition-colors min-h-[44px] h-auto relative py-1 pl-4 pr-1.5 border focus-within:ring-1 ${
-        isPerformanceMode ? '' : 'backdrop-blur-xl'
-      } ${
+      {/* Main Input Pill Capsule - Same exact iOS liquid glass style as message boxes */}
+      <div className={`flex-1 min-w-0 flex items-center rounded-[22px] transition-all min-h-[44px] h-auto relative py-1 pl-3.5 pr-1.5 focus-within:ring-1 ${
         isLight
-          ? 'bg-white/80 border-black/10 focus-within:border-black/20 focus-within:ring-black/5'
-          : 'bg-white/[0.03] hover:bg-white/[0.05] border-white/[0.08] focus-within:border-white/20 focus-within:ring-white/10'
+          ? 'bg-transparent backdrop-blur-2xl text-zinc-900 border border-black/15 shadow-sm focus-within:border-black/30'
+          : 'bg-transparent backdrop-blur-2xl text-white border border-white/[0.18] shadow-sm focus-within:border-white/40'
       }`}>
         {/* Core Message Text Area */}
         <textarea
@@ -9131,62 +9275,74 @@ const IsolatedChatInput: React.FC<IsolatedChatInputProps> = React.memo(({
           onChange={handleTextChange}
           onKeyDown={handleKeyDown}
           placeholder="Type a message..."
-          className={`bg-transparent text-xs ${isLight ? 'text-black placeholder:text-black/40' : 'text-white placeholder:text-white/40'} placeholder:font-normal focus:outline-none flex-1 ml-1 mr-1 font-sans font-normal tracking-wide resize-none py-1.5 scrollbar-none max-h-[200px] overflow-y-auto leading-relaxed self-center`}
+          className={`bg-transparent text-xs ${isLight ? 'text-black placeholder:text-black/40' : 'text-white placeholder:text-white/40'} placeholder:font-normal focus:outline-none flex-1 min-w-0 ml-1 mr-1 font-sans font-normal tracking-wide resize-none py-1.5 scrollbar-none max-h-[200px] overflow-y-auto leading-relaxed self-center`}
         />
 
-        {/* Secondary Option Buttons aligned to the right */}
-        <div className="flex items-center gap-1 flex-shrink-0 self-center">
-          <button
-            type="button"
-            onClick={() => {
-              if (selectedImage) {
-                setSelectedImage(null);
-              } else {
-                fileInputRef.current?.click();
-              }
-            }}
-            className={`w-[34px] h-[34px] rounded-full flex items-center justify-center transition-all cursor-pointer ${isLight ? 'hover:bg-black/5 text-black/40' : 'hover:bg-white/10 text-white/50'}`}
-            title="Attach photo"
-          >
-            <Image className="w-4 h-4" />
-          </button>
-
-          {isRepliesEnabled && (
+        {/* Secondary Action Buttons (Photo, Smart Replies, Menu) - Disappears when user starts writing */}
+        {!text && (
+          <div className="flex items-center gap-1 shrink-0 self-center transition-all duration-200">
             <button
               type="button"
-              onClick={() => setShowSuggestedAnswers(prev => !prev)}
-              className={`w-[34px] h-[34px] rounded-full flex items-center justify-center transition-all cursor-pointer ${showSuggestedAnswers ? 'bg-white/15 text-white' : (isLight ? 'hover:bg-black/5 text-black/40' : 'hover:bg-white/10 text-white/50')}`}
-              title="Smart Suggested Replies"
+              onClick={() => {
+                if (selectedImage) {
+                  setSelectedImage(null);
+                } else {
+                  fileInputRef.current?.click();
+                }
+              }}
+              className={`w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer ${
+                isLight
+                  ? 'bg-transparent backdrop-blur-2xl text-zinc-900 border border-black/15 shadow-sm hover:bg-black/5'
+                  : 'bg-transparent backdrop-blur-2xl text-white border border-white/[0.18] shadow-sm hover:bg-white/10'
+              }`}
+              title="Attach photo"
             >
-              <Sparkles className="w-4 h-4" />
+              <Image className="w-3.5 h-3.5" />
             </button>
-          )}
-          
-          <button
-            type="button"
-            onClick={() => setShowBottomSheet(true)}
-            className={`w-[34px] h-[34px] rounded-full flex items-center justify-center transition-all cursor-pointer border shadow-inner ${isLight ? 'bg-black/5 border-black/5 hover:bg-black/10 text-black/70' : 'bg-white/[0.03] border-white/[0.08] hover:bg-white/[0.05] text-white'}`}
-            title="Companion Settings"
-          >
-            <Menu className="w-3.5 h-3.5" />
-          </button>
-        </div>
+
+            {isRepliesEnabled && (
+              <button
+                type="button"
+                onClick={() => setShowSuggestedAnswers(prev => !prev)}
+                className={`w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer ${
+                  showSuggestedAnswers 
+                    ? 'bg-white/20 border-white/40 text-white' 
+                    : (isLight
+                        ? 'bg-transparent backdrop-blur-2xl text-zinc-900 border border-black/15 shadow-sm hover:bg-black/5'
+                        : 'bg-transparent backdrop-blur-2xl text-white border border-white/[0.18] shadow-sm hover:bg-white/10')
+                }`}
+                title="Smart Suggested Replies"
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+              </button>
+            )}
+            
+            <button
+              type="button"
+              onClick={() => setShowBottomSheet(true)}
+              className={`w-8 h-8 rounded-full flex items-center justify-center transition-all cursor-pointer ${
+                isLight
+                  ? 'bg-transparent backdrop-blur-2xl text-zinc-900 border border-black/15 shadow-sm hover:bg-black/5'
+                  : 'bg-transparent backdrop-blur-2xl text-white border border-white/[0.18] shadow-sm hover:bg-white/10'
+              }`}
+              title="Companion Settings"
+            >
+              <Menu className="w-3.5 h-3.5" />
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Exterior Small Circle Action Buttons */}
+      {/* Exterior Small Circle Action Buttons (Send / Continue) - Same exact iOS liquid glass style */}
       {text.trim() ? (
         <button
           type="submit"
           disabled={isStreaming}
-          className={`w-[44px] h-[44px] rounded-full flex items-center justify-center transition-all duration-200 flex-shrink-0 border shadow-sm self-end active:scale-95 backdrop-blur-xl cursor-pointer ${
-            !isStreaming
-              ? isLight
-                ? 'bg-white/80 hover:bg-white border-black/10 text-black'
-                : 'bg-white/[0.03] hover:bg-white/[0.08] border-white/[0.08] text-white'
-              : isLight 
-                ? 'bg-black/5 text-black/30 border-black/5 cursor-not-allowed'
-                : 'bg-white/5 text-white/30 border-white/5 cursor-not-allowed'
-          }`}
+          className={`w-[42px] h-[42px] rounded-full flex items-center justify-center transition-all duration-200 shrink-0 self-end active:scale-95 cursor-pointer ${
+            isLight
+              ? 'bg-transparent backdrop-blur-2xl text-zinc-900 border border-black/15 shadow-sm hover:bg-black/5'
+              : 'bg-transparent backdrop-blur-2xl text-white border border-white/[0.18] shadow-sm hover:bg-white/10'
+          } ${isStreaming ? 'opacity-40 cursor-not-allowed' : ''}`}
           title="Send message"
         >
           <Send className="w-4 h-4" />
@@ -9196,15 +9352,11 @@ const IsolatedChatInput: React.FC<IsolatedChatInputProps> = React.memo(({
           type="button"
           onClick={onContinueConversation}
           disabled={isStreaming || messagesLength === 0}
-          className={`w-[44px] h-[44px] rounded-full flex items-center justify-center transition-all duration-200 flex-shrink-0 border shadow-sm self-end active:scale-95 backdrop-blur-xl cursor-pointer ${
-            !isStreaming && messagesLength > 0
-              ? isLight
-                ? 'bg-white/80 hover:bg-white border-black/10 text-black'
-                : 'bg-white/[0.03] hover:bg-white/[0.08] border-white/[0.08] text-white'
-              : isLight 
-                ? 'bg-black/5 text-black/30 border-black/5 cursor-not-allowed'
-                : 'bg-white/5 text-white/30 border-white/5 cursor-not-allowed'
-          }`}
+          className={`w-[42px] h-[42px] rounded-full flex items-center justify-center transition-all duration-200 shrink-0 self-end active:scale-95 cursor-pointer ${
+            isLight
+              ? 'bg-transparent backdrop-blur-2xl text-zinc-900 border border-black/15 shadow-sm hover:bg-black/5'
+              : 'bg-transparent backdrop-blur-2xl text-white border border-white/[0.18] shadow-sm hover:bg-white/10'
+          } ${isStreaming || messagesLength === 0 ? 'opacity-40 cursor-not-allowed' : ''}`}
           title="Continue AI response"
         >
           <ChevronsRight className="w-5 h-5" />

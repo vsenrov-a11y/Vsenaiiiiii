@@ -28,6 +28,10 @@ class KeyStats {
 
 const keyRegistry = new Map<string, KeyStats>();
 
+let lastWorkingApiKey: string | null = null;
+let lastWorkingModel: string | null = null;
+let lastSuccessTime: number = 0;
+
 function getKeyStats(key: string): KeyStats {
   let stats = keyRegistry.get(key);
   if (!stats) {
@@ -46,6 +50,13 @@ function maskKey(key: string): string {
 function sortApiKeys(keys: string[]): string[] {
   const now = Date.now();
   return [...keys].sort((a, b) => {
+    // Prioritize the last working API key if it's not currently cooled down
+    const isLastWorkingA = (a === lastWorkingApiKey && getKeyStats(a).cooldownUntil <= now) ? 1 : 0;
+    const isLastWorkingB = (b === lastWorkingApiKey && getKeyStats(b).cooldownUntil <= now) ? 1 : 0;
+    if (isLastWorkingA !== isLastWorkingB) {
+      return isLastWorkingB - isLastWorkingA;
+    }
+
     const statsA = getKeyStats(a);
     const statsB = getKeyStats(b);
     
@@ -63,14 +74,19 @@ function sortApiKeys(keys: string[]): string[] {
       return statsA.errorCount - statsB.errorCount;
     }
     
-    return statsA.lastUsed - statsB.lastUsed;
+    return statsB.lastUsed - statsA.lastUsed;
   });
 }
 
-function markKeySuccess(key: string) {
+function markKeySuccess(key: string, modelName?: string) {
   const stats = getKeyStats(key);
   stats.errorCount = 0;
   stats.cooldownUntil = 0;
+  lastWorkingApiKey = key;
+  if (modelName) {
+    lastWorkingModel = modelName;
+  }
+  lastSuccessTime = Date.now();
 }
 
 function markKeyError(key: string, error: any) {
@@ -95,30 +111,30 @@ function markKeyError(key: string, error: any) {
     return;
   }
 
-  const isQuota = errMsg.includes("quota") || 
-                  errMsg.includes("exhausted") || 
-                  errMsg.includes("429") || 
-                  errMsg.includes("resource_exhausted") ||
-                  error?.status === 429 ||
-                  error?.code === 429;
-                  
-  const isTransient503 = errMsg.includes("503") || 
-                         errMsg.includes("high demand") || 
-                         errMsg.includes("unavailable") || 
-                         errMsg.includes("overloaded") || 
-                         error?.status === 503 || 
-                         error?.code === 503;
+  // Model-specific quota or model high demand (503 / 429 / rate limits) should NOT pause key for other fallback models
+  const isModelSpecific = errMsg.includes("model") ||
+                          errMsg.includes("per_model") ||
+                          errMsg.includes("generate_content") ||
+                          errMsg.includes("limit:") ||
+                          errMsg.includes("limit :") ||
+                          errMsg.includes("quota") ||
+                          errMsg.includes("503") ||
+                          errMsg.includes("429") ||
+                          errMsg.includes("high demand") ||
+                          errMsg.includes("unavailable") ||
+                          errMsg.includes("resource_exhausted") ||
+                          error?.status === 503 ||
+                          error?.status === 429 ||
+                          error?.code === 503 ||
+                          error?.code === 429;
 
-  if (isQuota) {
-    // Much longer cooldown for quota – 5 minutes instead of 15 seconds
-    stats.cooldownUntil = Date.now() + 5 * 60 * 1000;
-    console.warn(`[KeyManager] Key ${maskKey(key)} paused for 5 minutes due to quota/429 error.`);
-  } else if (isTransient503) {
-    console.warn(`[KeyManager] Key ${maskKey(key)} encountered transient 503. Key kept active.`);
-  } else {
-    stats.cooldownUntil = Date.now() + 30 * 1000; // 30 seconds for other errors
-    console.warn(`[KeyManager] Key ${maskKey(key)} paused for 30 seconds due to error: ${errMsg}`);
+  if (isModelSpecific) {
+    console.warn(`[KeyManager] Key ${maskKey(key)} encountered model-specific quota/busy status. Key kept active for fallback models.`);
+    return;
   }
+
+  stats.cooldownUntil = Date.now() + 15 * 1000; // brief 15 seconds for network drops
+  console.warn(`[KeyManager] Key ${maskKey(key)} briefly cooled down for 15s due to network error: ${errMsg.slice(0, 100)}`);
 }
 
 function getApiKeysToTry(customApiKey?: string, customApiKeys?: string[]): string[] {
@@ -160,6 +176,11 @@ async function startServer() {
   app.use(express.json({ limit: '50mb' }));
   app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
+  // Health check endpoint
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok" });
+  });
+
   // API endpoint to verify status and server API key presence
   app.get("/api/config", (req, res) => {
     res.json({
@@ -188,48 +209,67 @@ async function startServer() {
       const sortedKeys = sortApiKeys(apiKeysToTry);
       let success = false;
       let base64Image = "";
+      let isBillingOrFreeTierQuota = false;
+      let lastAvatarErrorMessage = "";
+
+      const avatarModels = ['gemini-3.1-flash-lite-image', 'gemini-3.1-flash-image'];
 
       for (let count = 0; count < sortedKeys.length; count++) {
         const apiKey = sortedKeys[count];
-        // Track use
         getKeyStats(apiKey).lastUsed = Date.now();
 
-        try {
-          console.log(`[Avatar API] Trying key ${maskKey(apiKey)} (attempt ${count + 1}/${sortedKeys.length})...`);
-          const ai = new GoogleGenAI({ 
-            apiKey,
-            httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
-          });
-          
-          const response = await ai.models.generateContent({
-            model: 'gemini-3.1-flash-image',
-            contents: {
-              parts: [{ text: prompt }]
-            }
-          });
+        const ai = new GoogleGenAI({ 
+          apiKey,
+          httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+        });
 
-          if (response.candidates?.[0]?.content?.parts) {
-            for (const part of response.candidates[0].content.parts) {
-              if (part.inlineData?.data) {
-                base64Image = part.inlineData.data;
-                break;
+        for (const model of avatarModels) {
+          try {
+            console.log(`[Avatar API] Trying key ${maskKey(apiKey)} with model ${model}...`);
+            const response = await ai.models.generateContent({
+              model,
+              contents: {
+                parts: [{ text: prompt }]
+              }
+            });
+
+            if (response.candidates?.[0]?.content?.parts) {
+              for (const part of response.candidates[0].content.parts) {
+                if (part.inlineData?.data) {
+                  base64Image = part.inlineData.data;
+                  break;
+                }
               }
             }
-          }
 
-          if (base64Image) {
-            markKeySuccess(apiKey);
-            success = true;
-            break;
+            if (base64Image) {
+              markKeySuccess(apiKey);
+              success = true;
+              break;
+            }
+          } catch (err: any) {
+            const errStr = (err?.message || String(err)).toLowerCase();
+            console.error(`[Avatar API] Error on key ${maskKey(apiKey)} with model ${model}:`, errStr);
+            lastAvatarErrorMessage = err?.message || String(err);
+            if (errStr.includes("limit: 0") || errStr.includes("limit:0") || errStr.includes("generate_content_free_tier_requests")) {
+              isBillingOrFreeTierQuota = true;
+            }
+            markKeyError(apiKey, err);
           }
-        } catch (err: any) {
-          console.error(`[Avatar API] Error on key ${maskKey(apiKey)}:`, err.message || err);
-          markKeyError(apiKey, err);
         }
+
+        if (success) break;
       }
 
       if (!success || !base64Image) {
-        return res.status(500).json({ error: "Could not generate portrait data from the provided prompt with any available API key." });
+        if (isBillingOrFreeTierQuota) {
+          return res.status(403).json({
+            error: "AI image generation requires a Gemini API key with billing enabled (image models have a limit of 0 on Google's free tier). You can still upload any avatar photo from your device or select an existing avatar."
+          });
+        }
+        return res.status(500).json({ 
+          error: lastAvatarErrorMessage || "Could not generate portrait data from the provided prompt with any available API key." 
+        });
       }
 
       res.json({ imageUrl: `data:image/png;base64,${base64Image}` });
@@ -275,8 +315,8 @@ async function startServer() {
           return res.status(400).json({ error: errMsg });
         }
       } else {
-        // Default: Gemini
-        const testModels = ["gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-flash-latest"];
+        // Default: Gemini - Free tier models
+        const testModels = ["gemini-3.8-flash", "gemini-3.1-flash-lite", "gemini-flash-latest"];
         let testSuccess = false;
         let lastTestError: any = null;
 
@@ -324,12 +364,14 @@ async function startServer() {
 
   const allSupportedModels = [
     "gemini-3.8-flash",
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-3.7-flash",
     "gemini-3.6-flash",
-    "gemini-3.1-pro-preview",
+    "gemini-3-flash-preview",
+    "gemini-2.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash-lite",
+    "gemini-2.5-pro",
+    "gemma-4",
     "gemini-flash-latest"
   ];
 
@@ -337,8 +379,15 @@ async function startServer() {
     if (!name) return "gemini-3.8-flash";
     const raw = name.trim().toLowerCase();
     if (allSupportedModels.includes(raw)) return raw;
-    if (raw.includes("pro") || raw.includes("reasoning")) return "gemini-3.1-pro-preview";
-    if (raw.includes("lite") || raw.includes("flash-lite")) return "gemini-3.1-flash-lite";
+    if (raw.includes("3.8")) return "gemini-3.8-flash";
+    if (raw.includes("3.6")) return "gemini-3.6-flash";
+    if (raw.includes("preview")) return "gemini-3-flash-preview";
+    if (raw.includes("2.5-pro")) return "gemini-2.5-pro";
+    if (raw.includes("2.5-flash-lite")) return "gemini-2.5-flash-lite";
+    if (raw.includes("2.5")) return "gemini-2.5-flash";
+    if (raw.includes("3.5-flash") || raw.includes("3.5") || raw.includes("lite")) return "gemini-3.5-flash-lite";
+    if (raw.includes("3.1")) return "gemini-3.1-flash-lite";
+    if (raw.includes("gemma")) return "gemma-4";
     return "gemini-3.8-flash";
   };
 
@@ -347,7 +396,7 @@ async function startServer() {
   app.post("/api/chat", async (req, res) => {
     let keepAliveInterval: any = null;
     try {
-      const { message, history, systemInstruction, customApiKey, customApiKeys, customApiProvider, samplers, linkedCharactersCount, selectedModel } = req.body;
+      const { message, messages, history, systemInstruction, customApiKey, customApiKeys, customApiProvider, samplers, linkedCharactersCount, selectedModel } = req.body;
 
       const apiKeysToTry = getApiKeysToTry(customApiKey, customApiKeys);
 
@@ -374,6 +423,7 @@ async function startServer() {
         temperature: samplers?.temperature !== undefined ? Number(samplers.temperature) : 0.8,
         topP: samplers?.topP !== undefined ? Number(samplers.topP) : undefined,
         maxOutputTokens: samplers?.generatedTokens !== undefined ? Number(samplers.generatedTokens) : 500,
+        thinkingConfig: { thinkingBudget: 0 },
         safetySettings: [
           { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
           { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -390,25 +440,29 @@ async function startServer() {
       }
 
       const cleanedContents: Array<{ role: string; parts: Array<{ text: string }> }> = [];
-      if (history && Array.isArray(history)) {
-        for (const item of history) {
-          if (!item || !item.text || typeof item.text !== 'string') continue;
-          const trimmed = item.text.trim();
-          if (!trimmed) continue;
-          // Skip any saved error messages
-          if (trimmed.startsWith('**Error:**') || trimmed.startsWith('Error:') || trimmed.startsWith('{ "error":') || trimmed.includes('All attempted API Keys')) {
-            continue;
-          }
-          const isUserMsg = item.isUser === true || item.role === 'user';
-          const role = isUserMsg ? "user" : "model";
-          if (cleanedContents.length > 0 && cleanedContents[cleanedContents.length - 1].role === role) {
-            cleanedContents[cleanedContents.length - 1].parts[0].text += "\n\n" + trimmed;
-          } else {
-            cleanedContents.push({
-              role,
-              parts: [{ text: trimmed }]
-            });
-          }
+      const historyList = (history && Array.isArray(history) && history.length > 0)
+        ? history
+        : (messages && Array.isArray(messages) ? messages : []);
+
+      for (const item of historyList) {
+        if (!item) continue;
+        const text = item.text || item.content || (item.parts && item.parts[0]?.text) || "";
+        if (typeof text !== 'string') continue;
+        const trimmed = text.trim();
+        if (!trimmed) continue;
+        // Skip any saved error messages
+        if (trimmed.startsWith('**Error:**') || trimmed.startsWith('Error:') || trimmed.startsWith('{ "error":') || trimmed.includes('All attempted API Keys')) {
+          continue;
+        }
+        const isUserMsg = item.isUser === true || item.role === 'user';
+        const role = isUserMsg ? "user" : "model";
+        if (cleanedContents.length > 0 && cleanedContents[cleanedContents.length - 1].role === role) {
+          cleanedContents[cleanedContents.length - 1].parts[0].text += "\n\n" + trimmed;
+        } else {
+          cleanedContents.push({
+            role,
+            parts: [{ text: trimmed }]
+          });
         }
       }
 
@@ -431,16 +485,36 @@ async function startServer() {
         }
       }
 
+      // Guarantee cleanedContents has at least one valid turn and ends with a user turn
+      if (cleanedContents.length === 0) {
+        cleanedContents.push({
+          role: "user",
+          parts: [{ text: (typeof message === 'string' && message.trim()) ? message.trim() : "Hello" }]
+        });
+      } else if (cleanedContents[cleanedContents.length - 1].role === "model") {
+        // If the conversation ends on an AI message (continuation/regeneration), provide a user prompt turn
+        cleanedContents.push({
+          role: "user",
+          parts: [{ text: (typeof message === 'string' && message.trim()) ? message.trim() : "[Continue scene / Respond]" }]
+        });
+      }
+
       const mappedModel = sanitizeModelName(selectedModel);
+      let primaryModel = mappedModel;
+      if (lastWorkingModel && allSupportedModels.includes(lastWorkingModel)) {
+        if (!selectedModel || mappedModel === lastWorkingModel) {
+          primaryModel = lastWorkingModel;
+        } else {
+          primaryModel = mappedModel;
+        }
+      }
+
       const standardFallbacks = [
-        "gemini-3.8-flash",
-        "gemini-3.1-flash-lite",
-        "gemini-3.5-flash",
-        "gemini-3.7-flash",
-        "gemini-3.1-pro-preview",
-        "gemini-flash-latest"
+        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite"
       ];
-      const models = [mappedModel, ...standardFallbacks.filter(m => m !== mappedModel)];
+      const models = [primaryModel, ...standardFallbacks.filter(m => m !== primaryModel)];
       
       const useStreaming = samplers?.isStreaming !== false;
       const sortedKeys = sortApiKeys(apiKeysToTry);
@@ -481,6 +555,9 @@ async function startServer() {
                 if (text) {
                   if (linkedCharactersCount === 0) text = sanitizeZeroCharacterOutput(text);
                   res.write(`data: ${JSON.stringify({ text })}\n\n`);
+                  if (typeof (res as any).flush === 'function') {
+                    (res as any).flush();
+                  }
                   hasStreamedAnyText = true;
                 }
               }
@@ -488,7 +565,7 @@ async function startServer() {
               if (hasStreamedAnyText) {
                 success = true;
                 keySucceeded = true;
-                markKeySuccess(apiKey);
+                markKeySuccess(apiKey, modelName);
                 break;
               } else {
                 console.warn(`[Chat API] Stream for ${modelName} emitted 0 text chunks. Attempting non-streaming fallback...`);
@@ -503,7 +580,7 @@ async function startServer() {
                   res.write(`data: ${JSON.stringify({ text })}\n\n`);
                   success = true;
                   keySucceeded = true;
-                  markKeySuccess(apiKey);
+                  markKeySuccess(apiKey, modelName);
                   break;
                 }
               }
@@ -519,7 +596,7 @@ async function startServer() {
                 res.write(`data: ${JSON.stringify({ text })}\n\n`);
                 success = true;
                 keySucceeded = true;
-                markKeySuccess(apiKey);
+                markKeySuccess(apiKey, modelName);
                 break;
               }
             }
@@ -538,25 +615,14 @@ async function startServer() {
               errMsg.includes("key has been deleted") ||
               errMsg.includes("invalid api key");
 
-            const isQuota = errMsg.includes("quota") || 
-                            errMsg.includes("exhausted") || 
-                            errMsg.includes("429") || 
-                            errMsg.includes("resource_exhausted") ||
-                            err?.status === 429 ||
-                            err?.code === 429;
-
-            const isModelSpecificQuota = errMsg.includes("tokens_per_model") || errMsg.includes("per_model") || errMsg.includes("limit: 25000000");
-
             if (isInvalidKey) {
               console.log(`[Chat API] Invalid key detected for ${maskKey(apiKey)}. Skipping remaining models for this key.`);
               markKeyError(apiKey, err);
               break; 
-            } else if (isQuota && !isModelSpecificQuota) {
-              console.log(`[Chat API] General Quota exceeded for key ${maskKey(apiKey)}. Skipping remaining models for this key.`);
+            } else {
+              console.log(`[Chat API] Model ${modelName} encountered error/busy on key ${maskKey(apiKey)}. Automatically switching to next fallback model...`);
               markKeyError(apiKey, err);
-              break;
-            } else if (isQuota && isModelSpecificQuota) {
-              console.log(`[Chat API] Model-specific quota exceeded for ${modelName} on ${maskKey(apiKey)}. Falling back to next model...`);
+              continue;
             }
           }
         }
@@ -574,7 +640,7 @@ async function startServer() {
         const keysTried = uniqueKeys.map(k => maskKey(k)).join(", ");
         console.error(`[Chat API] All keys/models failed. Unique keys tried: [${keysTried}]. Last error: ${detail}`);
         res.write(`data: ${JSON.stringify({ 
-          error: `All attempted API Keys and models failed. Last error: ${detail}. Unique keys tried: ${uniqueKeys.length} (${keysTried}). Please check your API keys or quota in Profile settings.` 
+          error: `Service temporarily busy. Tap Continue or Regenerate to try again.` 
         })}\n\n`);
       }
       res.write("data: [DONE]\n\n");
@@ -596,7 +662,7 @@ async function startServer() {
   app.post("/api/phone-chat", async (req, res) => {
     let keepAliveInterval: any = null;
     try {
-      const { message, history, contactName, contactPersona, recentWorldChatHistory, worldLocation, customApiKey, customApiKeys, selectedModel, samplers } = req.body;
+      const { message, messages, history, contactName, contactPersona, recentWorldChatHistory, worldLocation, customApiKey, customApiKeys, selectedModel, samplers } = req.body;
       const apiKeysToTry = getApiKeysToTry(customApiKey, customApiKeys);
 
       if (apiKeysToTry.length === 0) {
@@ -641,6 +707,7 @@ IMPORTANT TEXTING RULES:
         temperature: samplers?.temperature !== undefined ? Number(samplers.temperature) : 0.8,
         topP: samplers?.topP !== undefined ? Number(samplers.topP) : undefined,
         maxOutputTokens: samplers?.generatedTokens !== undefined ? Number(samplers.generatedTokens) : 250,
+        thinkingConfig: { thinkingBudget: 0 },
         safetySettings: [
           { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
           { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
@@ -657,24 +724,28 @@ IMPORTANT TEXTING RULES:
       }
 
       const cleanedContents: any[] = [];
-      if (history && Array.isArray(history)) {
-        for (const item of history) {
-          if (!item || !item.text || typeof item.text !== 'string') continue;
-          const trimmed = item.text.trim();
-          if (!trimmed) continue;
-          if (trimmed.startsWith('**Error:**') || trimmed.startsWith('Error:') || trimmed.startsWith('{ "error":') || trimmed.includes('All attempted API Keys')) {
-            continue;
-          }
-          const isUserMsg = item.isUser === true || item.role === 'user';
-          const role = isUserMsg ? "user" : "model";
-          if (cleanedContents.length > 0 && cleanedContents[cleanedContents.length - 1].role === role) {
-            cleanedContents[cleanedContents.length - 1].parts[0].text += "\n\n" + trimmed;
-          } else {
-            cleanedContents.push({
-              role,
-              parts: [{ text: trimmed }]
-            });
-          }
+      const historyList = (history && Array.isArray(history) && history.length > 0)
+        ? history
+        : (messages && Array.isArray(messages) ? messages : []);
+
+      for (const item of historyList) {
+        if (!item) continue;
+        const text = item.text || item.content || (item.parts && item.parts[0]?.text) || "";
+        if (typeof text !== 'string') continue;
+        const trimmed = text.trim();
+        if (!trimmed) continue;
+        if (trimmed.startsWith('**Error:**') || trimmed.startsWith('Error:') || trimmed.startsWith('{ "error":') || trimmed.includes('All attempted API Keys')) {
+          continue;
+        }
+        const isUserMsg = item.isUser === true || item.role === 'user';
+        const role = isUserMsg ? "user" : "model";
+        if (cleanedContents.length > 0 && cleanedContents[cleanedContents.length - 1].role === role) {
+          cleanedContents[cleanedContents.length - 1].parts[0].text += "\n\n" + trimmed;
+        } else {
+          cleanedContents.push({
+            role,
+            parts: [{ text: trimmed }]
+          });
         }
       }
 
@@ -694,17 +765,34 @@ IMPORTANT TEXTING RULES:
         }
       }
 
+      if (cleanedContents.length === 0) {
+        cleanedContents.push({
+          role: "user",
+          parts: [{ text: (typeof message === 'string' && message.trim()) ? message.trim() : "Hey" }]
+        });
+      } else if (cleanedContents[cleanedContents.length - 1].role === "model") {
+        cleanedContents.push({
+          role: "user",
+          parts: [{ text: (typeof message === 'string' && message.trim()) ? message.trim() : "[Continue]" }]
+        });
+      }
+
       const mappedModel = sanitizeModelName(selectedModel);
+      let primaryModel = mappedModel;
+      if (lastWorkingModel && allSupportedModels.includes(lastWorkingModel)) {
+        if (!selectedModel || mappedModel === lastWorkingModel || mappedModel === "gemini-3.5-flash-lite") {
+          primaryModel = lastWorkingModel;
+        } else {
+          primaryModel = mappedModel;
+        }
+      }
 
       const standardFallbacks = [
-        "gemini-3.8-flash",
-        "gemini-3.1-flash-lite",
-        "gemini-3.5-flash",
-        "gemini-3.7-flash",
-        "gemini-3.1-pro-preview",
-        "gemini-flash-latest"
+        "gemini-2.5-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite"
       ];
-      const models = [mappedModel, ...standardFallbacks.filter(m => m !== mappedModel)];
+      const models = [primaryModel, ...standardFallbacks.filter(m => m !== primaryModel)];
       
       const useStreaming = samplers?.isStreaming !== false;
       const sortedKeys = sortApiKeys(apiKeysToTry);
@@ -744,6 +832,9 @@ IMPORTANT TEXTING RULES:
                 }
                 if (text) {
                   res.write(`data: ${JSON.stringify({ text })}\n\n`);
+                  if (typeof (res as any).flush === 'function') {
+                    (res as any).flush();
+                  }
                   hasStreamedAnyText = true;
                 }
               }
@@ -751,7 +842,7 @@ IMPORTANT TEXTING RULES:
               if (hasStreamedAnyText) {
                 success = true;
                 keySucceeded = true;
-                markKeySuccess(apiKey);
+                markKeySuccess(apiKey, modelName);
                 break;
               } else {
                 console.warn(`[Chat API] Stream for ${modelName} emitted 0 text chunks. Attempting non-streaming fallback...`);
@@ -762,10 +853,10 @@ IMPORTANT TEXTING RULES:
                 });
                 let text = response.text || "";
                 if (text) {
-                                    res.write(`data: ${JSON.stringify({ text })}\n\n`);
+                  res.write(`data: ${JSON.stringify({ text })}\n\n`);
                   success = true;
                   keySucceeded = true;
-                  markKeySuccess(apiKey);
+                  markKeySuccess(apiKey, modelName);
                   break;
                 }
               }
@@ -777,10 +868,10 @@ IMPORTANT TEXTING RULES:
               });
               let text = response.text || "";
               if (text) {
-                                res.write(`data: ${JSON.stringify({ text })}\n\n`);
+                res.write(`data: ${JSON.stringify({ text })}\n\n`);
                 success = true;
                 keySucceeded = true;
-                markKeySuccess(apiKey);
+                markKeySuccess(apiKey, modelName);
                 break;
               }
             }
@@ -799,25 +890,14 @@ IMPORTANT TEXTING RULES:
               errMsg.includes("key has been deleted") ||
               errMsg.includes("invalid api key");
 
-            const isQuota = errMsg.includes("quota") || 
-                            errMsg.includes("exhausted") || 
-                            errMsg.includes("429") || 
-                            errMsg.includes("resource_exhausted") ||
-                            err?.status === 429 ||
-                            err?.code === 429;
-
-            const isModelSpecificQuota = errMsg.includes("tokens_per_model") || errMsg.includes("per_model") || errMsg.includes("limit: 25000000");
-
             if (isInvalidKey) {
               console.log(`[PhoneChat API] Invalid key detected for ${maskKey(apiKey)}. Skipping remaining models for this key.`);
               markKeyError(apiKey, err);
               break;
-            } else if (isQuota && !isModelSpecificQuota) {
-              console.log(`[PhoneChat API] General Quota exceeded for key ${maskKey(apiKey)}. Skipping remaining models for this key.`);
+            } else {
+              console.log(`[PhoneChat API] Model ${modelName} encountered error/busy on key ${maskKey(apiKey)}. Automatically switching to next fallback model...`);
               markKeyError(apiKey, err);
-              break;
-            } else if (isQuota && isModelSpecificQuota) {
-              console.log(`[PhoneChat API] Model-specific quota exceeded for ${modelName} on ${maskKey(apiKey)}. Falling back to next model...`);
+              continue;
             }
           }
         }
@@ -834,7 +914,7 @@ IMPORTANT TEXTING RULES:
         const keysTried = uniqueKeys.map(k => maskKey(k)).join(", ");
         console.error(`[PhoneChat API] All keys/models failed. Unique keys tried: [${keysTried}]. Last error: ${detail}`);
         res.write(`data: ${JSON.stringify({ 
-          error: `All attempted API Keys and models failed. Last error: ${detail}. Unique keys tried: ${uniqueKeys.length} (${keysTried}). Please check your API keys or quota in Profile settings.` 
+          error: `Service temporarily busy. Tap Continue or Regenerate to try again.` 
         })}\n\n`);
       }
 
@@ -904,10 +984,11 @@ IMPORTANT TEXTING RULES:
 You NEVER roleplay or speak. You ONLY maintain the persistent world in the background based on the User's message and the Character's response.
 
 CORE PRINCIPLES:
-1. Realism: Every change must have a believable cause and effect. Characters have finite stamina.
-2. Time System: Time moves naturally based on actions (e.g. sleep ~8h, travel ~1-2h, workouts/intimacy ~1h).
-3. Statuses: Sleep restores energy/mood. Exercise and intimacy significantly drain energy, increase thirst, and induce realistic physical fatigue. Hunger/thirst drain steadily over time.
-4. Relationships: Progress gradually based on actual interaction quality, respect, and trust.
+1. Realism & Human Stamina: Normal conversations, casual walking, sitting, or everyday dialogue barely drain energy (at most 0 to 1 point or stay identical). Humans do NOT collapse or pass out from ordinary roleplay.
+2. Realistic Status Calibration: Keep vital stats (health, energy, hunger, thirst, hygiene, mood) healthy, resilient, and stable (typically in the 70-100 range).
+3. Status Recovery: Resting, sleeping, or relaxing easily restores Energy and Health back to 90-100. Eating or drinking restores Hunger and Thirst back to 90-100. Bathing/washing restores Hygiene to 95-100.
+4. Floor & Safety: NEVER drain any stat into the 0-30 range unless the user explicitly narrated a mortal trauma in their own words. NEVER force passing out, fainting, or incapacitation.
+5. Time System: Time moves naturally based on actions (e.g. sleep ~8h, travel ~1-2h, workouts/intimacy ~1h).
 
 Current World Context:
 - World: "${worldName || 'Active World'}"
@@ -916,7 +997,6 @@ ${charactersList}
 - Current Calendar/Time: "${currentCalendar || 'Spring - Afternoon'}"
 - Current Location: "${currentLocation || 'Unspecified'}"
 - Current Weather: "${currentWeather || 'Clear'}"
-- Current Reputation: "${currentReputation || 'Neutral (5/10)'}"
 
 Current Player State (Previous):
 ${previousStateStr}
@@ -928,9 +1008,9 @@ Available Ambient Soundscapes:
 ${ambientsList || "(None defined)"}
 
 UPDATE RULES:
-- Return "no_change" for calendar, location, weather, reputation, ambient, and place if they did not naturally change.
-- relationships: update the 9 dimensions (1-10) for the targetCharacterId.
+- Return "no_change" for calendar, location, weather, ambient, and place if they did not naturally change.
 - characterState: update status, inventory, appearance, phone, longterm, and pregnancy realistically based on Previous State.
+- keyMemory: if a new key factual revelation, secret, promise, name introduction, or major milestone occurred, summarize it in one concise factual sentence (e.g., "User introduced themselves as Elena's childhood friend", "Agreed to investigate the haunted tower together"). Return "none" if nothing major occurred.
 `;
 
       const modelsToTry = [
@@ -980,24 +1060,9 @@ UPDATE RULES:
                     calendar: { type: Type.STRING },
                     location: { type: Type.STRING },
                     weather: { type: Type.STRING },
-                    reputation: { type: Type.STRING },
+                    keyMemory: { type: Type.STRING },
                     targetCharacterId: { type: Type.STRING },
                     targetCharacterName: { type: Type.STRING },
-                    relationships: {
-                      type: Type.OBJECT,
-                      properties: {
-                        attraction: { type: Type.INTEGER },
-                        friendship: { type: Type.INTEGER },
-                        trust: { type: Type.INTEGER },
-                        respect: { type: Type.INTEGER },
-                        loyalty: { type: Type.INTEGER },
-                        fear: { type: Type.INTEGER },
-                        anger: { type: Type.INTEGER },
-                        rivalry: { type: Type.INTEGER },
-                        lust: { type: Type.INTEGER }
-                      },
-                      required: ["attraction", "friendship", "trust", "respect", "loyalty", "fear", "anger", "rivalry", "lust"]
-                    },
                     characterState: {
                       type: Type.OBJECT,
                       properties: {
@@ -1074,7 +1139,7 @@ UPDATE RULES:
                       }
                     }
                   },
-                  required: ["sceneMood", "place", "ambient", "calendar", "location", "weather", "reputation"]
+                  required: ["sceneMood", "place", "ambient", "calendar", "location", "weather"]
                 }
               }
             });
@@ -1090,6 +1155,17 @@ UPDATE RULES:
             lastErrorOnKey = err;
 
             const errMsg = (err.message || "").toLowerCase();
+            const is503HighDemand = errMsg.includes("503") || 
+                                    errMsg.includes("unavailable") || 
+                                    errMsg.includes("high demand") || 
+                                    err?.status === 503 || 
+                                    err?.code === 503;
+
+            if (is503HighDemand) {
+              console.log(`[Analyzer API] Model ${modelName} is temporarily unavailable (503). Trying next model fallback...`);
+              continue;
+            }
+
             const isInvalidKey = 
               errMsg.includes("api_key_invalid") || 
               errMsg.includes("key not valid") || 
@@ -1123,8 +1199,6 @@ UPDATE RULES:
           calendar: "no_change",
           location: "no_change",
           weather: "no_change",
-          reputation: "no_change",
-          relationships: null,
           characterState: null
         });
       }
@@ -1147,6 +1221,17 @@ UPDATE RULES:
         result = {};
       }
 
+      if (result.characterState && result.characterState.status) {
+        const s = result.characterState.status;
+        s.health = Math.min(100, Math.max(50, typeof s.health === 'number' ? s.health : 100));
+        s.energy = Math.min(100, Math.max(45, typeof s.energy === 'number' ? s.energy : 85));
+        s.hunger = Math.min(100, Math.max(40, typeof s.hunger === 'number' ? s.hunger : 90));
+        s.thirst = Math.min(100, Math.max(40, typeof s.thirst === 'number' ? s.thirst : 90));
+        s.hygiene = Math.min(100, Math.max(40, typeof s.hygiene === 'number' ? s.hygiene : 95));
+        s.mood = Math.min(100, Math.max(40, typeof s.mood === 'number' ? s.mood : 85));
+        s.arousal = Math.min(100, Math.max(0, typeof s.arousal === 'number' ? s.arousal : 10));
+      }
+
       return res.json({ 
         success: true, 
         sceneMood: result.sceneMood || "Calm",
@@ -1155,10 +1240,8 @@ UPDATE RULES:
         calendar: result.calendar || "no_change",
         location: result.location || "no_change",
         weather: result.weather || "no_change",
-        reputation: result.reputation || "no_change",
         targetCharacterId: result.targetCharacterId,
         targetCharacterName: result.targetCharacterName,
-        relationships: result.relationships,
         characterState: result.characterState
       });
     } catch (err: any) {
@@ -1171,8 +1254,6 @@ UPDATE RULES:
         calendar: "no_change",
         location: "no_change",
         weather: "no_change",
-        reputation: "no_change",
-        relationships: null,
         characterState: null
       });
     }

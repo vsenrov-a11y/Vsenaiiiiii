@@ -132,7 +132,7 @@ export function UserPersonaCreator({ isLight, onClose, onSave, initialData }: Us
       </AnimatePresence>
 
       {/* Header */}
-      <div className={`px-4 py-3 flex items-center justify-center relative border-b ${isLight ? 'text-black border-black/5' : 'text-white border-white/5'}`}>
+      <div className={`px-4 pb-3 pt-[calc(env(safe-area-inset-top,0px)+0.75rem)] flex items-center justify-center relative border-b transition-colors ${isLight ? 'text-black border-black/5' : 'text-white border-white/5'}`}>
         <button onClick={onClose} className={`absolute left-4 p-2 -ml-2 rounded-full transition-colors ${isLight ? 'bg-black/5 hover:bg-black/10' : 'bg-white/5 hover:bg-white/10'}`}>
           <X className="w-5 h-5" />
         </button>

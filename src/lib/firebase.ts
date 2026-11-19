@@ -13,6 +13,7 @@ import {
 } from 'firebase/auth';
 import { 
   getFirestore, 
+  initializeFirestore,
   doc, 
   getDoc, 
   setDoc, 
@@ -20,6 +21,11 @@ import {
   getDocs, 
   deleteDoc,
   onSnapshot,
+  addDoc,
+  serverTimestamp,
+  query,
+  where,
+  orderBy,
   Firestore
 } from 'firebase/firestore';
 import firebaseConfig from '../../firebase-applet-config.json';
@@ -41,34 +47,79 @@ googleProvider.setCustomParameters({
 // Initialize Firestore with specific database ID if configured
 const databaseId = firebaseConfig.firestoreDatabaseId && firebaseConfig.firestoreDatabaseId.trim() !== ''
   ? firebaseConfig.firestoreDatabaseId
-  : '(default)';
+  : 'ai-studio-vsenai-24528b97-a25b-43e5-92ea-f2d6da5dbc49';
 
-export const db: Firestore = getFirestore(app, databaseId);
+let firestoreInstance: Firestore;
+try {
+  firestoreInstance = initializeFirestore(app, {}, databaseId);
+} catch (e) {
+  firestoreInstance = getFirestore(app, databaseId);
+}
+
+export const db: Firestore = firestoreInstance;
+
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  };
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null): FirestoreErrorInfo {
+  const errMsg = error instanceof Error ? error.message : String(error);
+  const isQuota = errMsg.includes('resource-exhausted') || errMsg.includes('Quota limit exceeded') || errMsg.includes('resource_exhausted');
+
+  const errInfo: FirestoreErrorInfo = {
+    error: errMsg,
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData?.map(provider => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || []
+    },
+    operationType,
+    path
+  };
+
+  if (isQuota) {
+    console.warn('[Firestore] Write quota limit reached for this project. Operating in local storage offline mode.');
+  } else {
+    console.warn('Firestore Notice:', JSON.stringify(errInfo));
+  }
+  return errInfo;
+}
 
 /**
- * Sign in with Google Popup. If currently anonymous, links account or logs in.
+ * Sign in with Google Popup directly to preserve the user click gesture and sync all local data.
  */
 export async function signInWithGoogle(): Promise<User | null> {
   try {
-    const currentUser = auth.currentUser;
-    let user: User | null = null;
-    if (currentUser && currentUser.isAnonymous) {
-      try {
-        const cred = await linkWithPopup(currentUser, googleProvider);
-        user = cred.user;
-      } catch (linkErr: any) {
-        // If account already exists with different credentials, sign in directly
-        if (linkErr?.code === 'auth/credential-already-in-use') {
-          const cred = await signInWithPopup(auth, googleProvider);
-          user = cred.user;
-        } else {
-          throw linkErr;
-        }
-      }
-    } else {
-      const result = await signInWithPopup(auth, googleProvider);
-      user = result.user;
-    }
+    const result = await signInWithPopup(auth, googleProvider);
+    const user = result.user;
 
     if (user && !user.isAnonymous) {
       try {
@@ -76,7 +127,15 @@ export async function signInWithGoogle(): Promise<User | null> {
       } catch {}
     }
     return user;
-  } catch (err) {
+  } catch (err: any) {
+    if (err?.code === 'auth/popup-blocked') {
+      console.warn('Google Sign-In popup was blocked by browser or iframe policy:', err);
+      throw new Error('Popup blocked by browser. Please allow popups for this site or open in a new tab.');
+    }
+    if (err?.code === 'auth/popup-closed-by-user') {
+      console.log('Google Sign-In popup was closed by user.');
+      return null;
+    }
     console.error('Failed to sign in with Google:', err);
     throw err;
   }
@@ -126,19 +185,26 @@ export async function ensureAuthenticatedUser(): Promise<User | null> {
   });
 }
 
-/**
- * Sign out current user and fallback to anonymous
- */
-export async function logoutUser(): Promise<void> {
+// --- FUNCTION 1: SIGN OUT & WIPE LOCAL DATA ---
+export async function handleSignOut(): Promise<void> {
   try {
-    localStorage.removeItem('vsen_is_google_linked');
-  } catch {}
-  try {
+    // 1. Sign out of Firebase Auth
     await signOut(auth);
-    await signInAnonymously(auth);
-  } catch (err) {
-    console.error('Logout failed:', err);
+    
+    // 2. Wipe LocalStorage & SessionStorage (destroys saved API keys)
+    try {
+      localStorage.clear();
+      sessionStorage.clear();
+    } catch {}
+    
+    console.log("Signed out and successfully cleared all device storage!");
+  } catch (error) {
+    console.error("Error during sign out:", error);
   }
+}
+
+export async function logoutUser(): Promise<void> {
+  await handleSignOut();
 }
 
 export { 
@@ -152,5 +218,10 @@ export {
   collection, 
   getDocs, 
   deleteDoc,
-  onSnapshot 
+  onSnapshot,
+  addDoc,
+  serverTimestamp,
+  query,
+  where,
+  orderBy
 };

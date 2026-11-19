@@ -63,6 +63,7 @@ export interface Persona {
   socialPosts?: SocialPost[];
   socialAvatar?: string;
   updatedAt?: number;
+  userId?: string;
 }
 
 export interface ChatMessage {
@@ -70,11 +71,15 @@ export interface ChatMessage {
   role: 'user' | 'ai' | 'system';
   text: string;
   timestamp: string;
+  isUser?: boolean;
   isStreaming?: boolean;
   isPinned?: boolean;
   alternatives?: string[];
   activeAlternativeIndex?: number;
   image?: string;
+  audio?: string;
+  audioName?: string;
+  audioDuration?: number;
 }
 
 export interface WorldEvent {
@@ -97,6 +102,11 @@ export interface InterCharacterRelation {
 
 export interface ChatHistory {
   id: string;
+  sessionId?: string;
+  userId?: string;
+  characterId?: string;
+  characterName?: string;
+  createdAt?: any;
   personaId: string;
   personaName: string;
   avatarGradient: string;
@@ -104,11 +114,16 @@ export interface ChatHistory {
   timestamp: string;
   messages: ChatMessage[];
   updatedAt: number;
+  lastMessageAt?: number;
+  deletedMessageIds?: string[];
   isPinned?: boolean;
   isArchived?: boolean;
   linkedWorldId?: string;
   linkedCharacterIds?: string[];
   userPersonaId?: string;
+  userPersonaName?: string;
+  userPersonaAvatar?: string;
+  userPersonaDesc?: string;
   enableSceneDetection?: boolean;
   activePlaceName?: string;
   activeAmbientName?: string;
@@ -122,6 +137,7 @@ export interface ChatHistory {
   worldReputation?: string;
   worldSceneMood?: string;
   storyMemories?: string[];
+  characterMemories?: Record<string, string[]>;
   pinnedMessages?: string[];
   worldEvents?: WorldEvent[];
   relationshipScores?: Record<string, Record<string, number>>;
@@ -172,6 +188,7 @@ export interface UserPersona {
   isDefault?: boolean;
   likes?: string;
   dislikes?: string;
+  updatedAt?: number;
 }
 
 export interface UserProfile {
@@ -180,6 +197,7 @@ export interface UserProfile {
   description: string;
   avatarGradient?: string;
   avatar?: string;
+  updatedAt?: number;
 }
 
 export interface StorageConfig {
@@ -190,6 +208,9 @@ export interface StorageConfig {
   customPersonas: Persona[];
   characters?: Persona[];
   chatHistories: ChatHistory[];
+  deletedChatIds?: string[];
+  deletedPersonaIds?: string[];
+  deletedWorldIds?: string[];
   likedPersonaIds?: string[];
   likedWorldIds?: string[];
   userPersonas?: UserPersona[];
@@ -241,8 +262,9 @@ export interface Place {
 export interface AmbientSound {
   id?: string;
   name: string;
-  audioFile: string; // audio file url or base64 or descriptor
-  triggerDescription?: string; // Optional for "General", required for custom ambient sounds
+  audioFile?: string; // audio/video file url or base64 or descriptor
+  videoFile?: string; // background video file url or base64
+  triggerDescription?: string; // Optional for "General", required for custom ambient video/sounds
 }
 
 export interface World {
@@ -279,5 +301,14 @@ export interface World {
     socialLikes?: number;
     socialAvatar?: string;
   }>;
+  userId?: string;
 }
+
+export interface KotlinFile {
+  name: string;
+  path: string;
+  description: string;
+  code: string;
+}
+
 

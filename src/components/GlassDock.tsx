@@ -18,7 +18,7 @@ export const GlassDock: React.FC<GlassDockProps> = React.memo(({ activeTab, onTa
   ] as const;
 
   return (
-    <div className={`absolute bottom-0 left-0 right-0 z-40 py-2 flex justify-center border-t transition-all duration-200 ${
+    <div className={`absolute bottom-0 left-0 right-0 z-40 pt-2 pb-[calc(env(safe-area-inset-bottom,0px)+0.5rem)] flex justify-center border-t transition-all duration-200 ${
       isLight 
         ? 'bg-white/95 border-black/[0.05] shadow-[0_-4px_16px_rgba(0,0,0,0.03)]' 
         : 'bg-[#121214]/95 border-t border-white/[0.06] shadow-[0_-8px_24px_rgba(0,0,0,0.5)]'

@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { Persona, ChatHistory, StorageConfig } from '../../types';
+import { getLastMessageTime } from '../../utils/storage';
+import { getValidPreviewMessage, renderCardPreviewText } from '../../utils/cardTextHelper';
 import { SafeImage } from '../common/SafeImage';
 import { 
   ArrowLeft, 
@@ -58,17 +60,13 @@ export function CharacterProfileScreen({
 
   const isLiked = likedPersonaIds.includes(persona.id);
   const chatSessions = (storageConfig.chatHistories || []).filter(h => h.personaId === persona.id && !h.isArchived);
-  const sortedSessions = [...chatSessions].sort((a, b) => {
-    const timeA = (typeof a.updatedAt === 'number' && !isNaN(a.updatedAt)) ? a.updatedAt : (a.timestamp ? new Date(a.timestamp).getTime() || 0 : 0);
-    const timeB = (typeof b.updatedAt === 'number' && !isNaN(b.updatedAt)) ? b.updatedAt : (b.timestamp ? new Date(b.timestamp).getTime() || 0 : 0);
-    return timeB - timeA;
-  });
+  const sortedSessions = [...chatSessions].sort((a, b) => getLastMessageTime(b) - getLastMessageTime(a));
   const mostRecentSession = sortedSessions[0] || null;
   const hasExperience = chatSessions.length > 0 && chatSessions.some(s => s.messages && s.messages.length > 0);
 
   const messageCount = chatSessions.reduce((acc, session) => acc + (session.messages?.length || 0), 0);
   
-  const mostRecentTimestamp = sortedSessions[0]?.updatedAt || (sortedSessions[0]?.timestamp ? new Date(sortedSessions[0].timestamp).getTime() : 0);
+  const mostRecentTimestamp = getLastMessageTime(sortedSessions[0]);
   const lastConversationDate = mostRecentTimestamp ? new Date(mostRecentTimestamp) : null;
   const isLight = storageConfig?.theme === 'light';
 
@@ -214,7 +212,7 @@ export function CharacterProfileScreen({
       {/* FIXED HEADER UPPER HALF BLOCK */}
       <div className="flex-shrink-0">
         {/* Header Profile Cover Accent & Back Action */}
-        <div className="relative w-full pt-4 px-4 pb-2 flex-shrink-0">
+        <div className="relative w-full pt-[calc(env(safe-area-inset-top,0px)+1rem)] px-4 pb-2 flex-shrink-0">
           <div className="flex items-center justify-between z-20 relative">
             <button
               onClick={onBack}
@@ -310,7 +308,7 @@ export function CharacterProfileScreen({
           </div>
 
           <div className="w-full mt-3 z-10 px-5 flex gap-2">
-            {persona.isCustom && (
+            {true && (
               <button
                 onClick={() => {
                   if (typeof navigator !== 'undefined' && navigator.vibrate) {
@@ -539,7 +537,7 @@ export function CharacterProfileScreen({
                         </span>
                       </div>
                       <p className={`text-[11px] font-sans line-clamp-1 leading-snug ${isLight ? 'text-black/70' : 'text-white/80'}`}>
-                        {session.messages?.[session.messages.length - 1]?.text || 'No messages yet...'}
+                        {renderCardPreviewText(getValidPreviewMessage(session), isLight)}
                       </p>
                     </button>
                   );
@@ -591,7 +589,7 @@ export function CharacterProfileScreen({
                 </div>
               </button>
 
-              {chatSessions.sort((a, b) => new Date(b.updatedAt || b.timestamp).getTime() - new Date(a.updatedAt || a.timestamp).getTime()).map(session => (
+              {chatSessions.sort((a, b) => getLastMessageTime(b) - getLastMessageTime(a)).map(session => (
                 <button
                   key={session.id}
                   onClick={() => {
@@ -613,7 +611,7 @@ export function CharacterProfileScreen({
                     </span>
                   </div>
                   <p className={`text-sm font-sans line-clamp-2 ${isLight ? 'text-black' : 'text-white/90'}`}>
-                    {session.messages?.[session.messages.length - 1]?.text || 'No messages yet...'}
+                    {renderCardPreviewText(getValidPreviewMessage(session), isLight)}
                   </p>
                 </button>
               ))}

@@ -4,6 +4,8 @@ import { ChatHistory, Persona, StorageConfig, World } from '../../types';
 import { SafeImage } from '../common/SafeImage';
 import { MessageSquare, Calendar, Trash2, ArrowRight, Sparkles, FolderArchive, Pin, PinOff, Archive, ArchiveRestore, X, AlertTriangle, Globe } from 'lucide-react';
 import { CharacterProfileScreen } from './CharacterProfileScreen';
+import { getLastMessageTime } from '../../utils/storage';
+import { getValidPreviewMessage, renderCardPreviewText } from '../../utils/cardTextHelper';
 
 interface ChatHistoryScreenProps {
   chatHistories: ChatHistory[];
@@ -241,31 +243,21 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = React.memo(({
     }
   };
 
-  // Helper to extract the most appropriate display text for the card - simplified to show the absolute latest message
+  // Helper to extract the most appropriate display text for the card - filters out error messages
   const getDisplayMessage = (chat: ChatHistory) => {
-    if (chat.messages && chat.messages.length > 0) {
-      const lastMsg = chat.messages[chat.messages.length - 1];
-      if (lastMsg && lastMsg.text && lastMsg.text.trim() !== '') {
-        return lastMsg.text;
-      }
-    }
-    // Fallbacks
-    if (chat.lastMessage && chat.lastMessage.trim() !== '') return chat.lastMessage;
-    return "No conversation history yet...";
+    return getValidPreviewMessage(chat);
   };
 
   // Robust filter for world chats
   const isWorldChat = (h: ChatHistory) => !!h.linkedWorldId || h.personaId.startsWith('world-');
 
-  const getSessionTime = (h: ChatHistory) => h.updatedAt || parseInt(h.id?.split('-')[1]) || 0;
-
-  // Filter histories
+  // Filter histories sorted strictly by the last message time (newest message on top)
   const mainChats = chatHistories
     .filter(h => !h.isArchived && !isWorldChat(h))
     .sort((a, b) => {
       if (a.isPinned && !b.isPinned) return -1;
       if (!a.isPinned && b.isPinned) return 1;
-      return getSessionTime(b) - getSessionTime(a);
+      return getLastMessageTime(b) - getLastMessageTime(a);
     });
 
   const worldChats = chatHistories
@@ -273,7 +265,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = React.memo(({
     .sort((a, b) => {
       if (a.isPinned && !b.isPinned) return -1;
       if (!a.isPinned && b.isPinned) return 1;
-      return getSessionTime(b) - getSessionTime(a);
+      return getLastMessageTime(b) - getLastMessageTime(a);
     });
 
   const archivedChats = chatHistories
@@ -281,7 +273,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = React.memo(({
     .sort((a, b) => {
       if (a.isPinned && !b.isPinned) return -1;
       if (!a.isPinned && b.isPinned) return 1;
-      return 0;
+      return getLastMessageTime(b) - getLastMessageTime(a);
     });
 
   const archivedCharacters = archivedChats.filter(c => !c.linkedWorldId);
@@ -293,7 +285,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = React.memo(({
   return (
     <div className={`flex-1 flex flex-col relative h-full overflow-hidden select-none font-sans ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#121214]'}`}>
       {/* Fixed Top Header */}
-      <div className={`flex-none px-5 pt-6 pb-2 border-b z-10 flex flex-col gap-4 ${isLight ? 'bg-white border-black/[0.05]' : 'bg-[#121214] border-white/[0.05]'}`}>
+      <div className={`flex-none px-5 pt-[calc(env(safe-area-inset-top,0px)+1rem)] pb-2 border-b z-10 flex flex-col gap-4 transition-colors ${isLight ? 'bg-white border-black/[0.05]' : 'bg-[#121214] border-white/[0.05]'}`}>
         <div className="flex items-center justify-between font-sans">
           <div className="flex flex-col">
             <h2 className={`text-2xl font-extrabold tracking-tight font-sans ${isLight ? 'text-black' : 'text-white'}`}>My Chats</h2>
@@ -535,7 +527,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = React.memo(({
                           <p className={`text-[11px] mt-1 leading-relaxed truncate font-normal tracking-wide font-sans ${
                             isLight ? 'text-black/55' : 'text-white/50'
                           }`}>
-                            {getDisplayMessage(chat)}
+                            {renderCardPreviewText(getDisplayMessage(chat), isLight)}
                           </p>
                         </div>
                       </div>
@@ -653,7 +645,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = React.memo(({
                             <p className={`text-[11px] mt-1 leading-relaxed truncate font-normal tracking-wide font-sans ${
                               isLight ? 'text-black/55' : 'text-white/50'
                             }`}>
-                              {getDisplayMessage(chat)}
+                              {renderCardPreviewText(getDisplayMessage(chat), isLight)}
                             </p>
                           </div>
                         </div>
@@ -1074,7 +1066,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = React.memo(({
                               <p className={`text-[11px] mt-1 leading-relaxed truncate font-normal tracking-wide font-sans ${
                                 isLight ? 'text-black/55' : 'text-white/50'
                               }`}>
-                                {getDisplayMessage(chat)}
+                                {renderCardPreviewText(getDisplayMessage(chat), isLight)}
                               </p>
                             </div>
                           </div>
@@ -1194,7 +1186,7 @@ export const ChatHistoryScreen: React.FC<ChatHistoryScreenProps> = React.memo(({
                               <p className={`text-[11px] mt-1 leading-relaxed truncate font-normal tracking-wide font-sans ${
                                 isLight ? 'text-black/55' : 'text-white/50'
                               }`}>
-                                {getDisplayMessage(chat)}
+                                {renderCardPreviewText(getDisplayMessage(chat), isLight)}
                               </p>
                             </div>
                           </div>

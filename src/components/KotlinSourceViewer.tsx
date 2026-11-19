@@ -1,21 +1,26 @@
 import React, { useState } from 'react';
 import { KOTLIN_FILES } from '../data/kotlinCode';
-import { X, Copy, Check, FileCode2, Terminal, Layers } from 'lucide-react';
+import { FLUTTER_FILES } from '../data/flutterCode';
+import { X, Copy, Check, FileCode2, Terminal, Layers, Smartphone } from 'lucide-react';
 
 interface KotlinSourceViewerProps {
   isOpen: boolean;
   onClose: () => void;
+  defaultTab?: 'flutter' | 'kotlin';
 }
 
-export const KotlinSourceViewer: React.FC<KotlinSourceViewerProps> = ({ isOpen, onClose }) => {
+export const KotlinSourceViewer: React.FC<KotlinSourceViewerProps> = ({ isOpen, onClose, defaultTab = 'flutter' }) => {
+  const [activeFramework, setActiveFramework] = useState<'flutter' | 'kotlin'>(defaultTab);
   const [activeFileIdx, setActiveFileIdx] = useState(0);
   const [copied, setCopied] = useState(false);
 
   if (!isOpen) return null;
 
-  const activeFile = KOTLIN_FILES[activeFileIdx];
+  const currentFiles = activeFramework === 'flutter' ? FLUTTER_FILES : KOTLIN_FILES;
+  const activeFile = currentFiles[activeFileIdx] || currentFiles[0];
 
   const handleCopy = () => {
+    if (!activeFile) return;
     navigator.clipboard.writeText(activeFile.code);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -28,20 +33,69 @@ export const KotlinSourceViewer: React.FC<KotlinSourceViewerProps> = ({ isOpen, 
         <div className="p-5 border-b border-white/10 flex items-center justify-between bg-[#181818]">
           <div className="flex items-center gap-3">
             <div className="w-10 h-10 rounded-2xl bg-[#1E1E1E] border border-white/5 flex items-center justify-center shadow-lg">
-              <Layers className="w-5 h-5 text-[#E0E0E0]" />
+              {activeFramework === 'flutter' ? (
+                <Smartphone className="w-5 h-5 text-[#8B5CF6]" />
+              ) : (
+                <Layers className="w-5 h-5 text-[#E0E0E0]" />
+              )}
             </div>
             <div className="font-sans">
-              <h3 className="text-sm font-bold text-white tracking-wide font-sans">Kotlin & Jetpack Compose Core Architecture</h3>
-              <p className="text-xs text-[#888] font-light tracking-wide mt-0.5">Native source files compiled for Vsen.Ai on Android</p>
+              <div className="flex items-center gap-2">
+                <h3 className="text-sm font-bold text-white tracking-wide font-sans">
+                  {activeFramework === 'flutter' ? 'Flutter & Firebase Production Codebase' : 'Kotlin & Jetpack Compose Core Architecture'}
+                </h3>
+                <span className={`text-[10px] px-2 py-0.5 rounded-full font-bold uppercase ${
+                  activeFramework === 'flutter' ? 'bg-purple-500/20 text-purple-300 border border-purple-500/30' : 'bg-white/10 text-white/80 border border-white/15'
+                }`}>
+                  {activeFramework === 'flutter' ? 'Flutter v3.19+' : 'Android'}
+                </span>
+              </div>
+              <p className="text-xs text-[#888] font-light tracking-wide mt-0.5">
+                {activeFramework === 'flutter'
+                  ? 'Cloud Firestore subcollection streaming, unlimited offline cache & secure storage'
+                  : 'Native source files compiled for Vsen.Ai on Android'}
+              </p>
             </div>
           </div>
 
-          <button
-            onClick={onClose}
-            className="p-2.5 rounded-full bg-[#1E1E1E] hover:bg-[#2A2A2A] border border-white/5 text-[#AAA] hover:text-white transition-all active:scale-95"
-          >
-            <X className="w-4.5 h-4.5" />
-          </button>
+          <div className="flex items-center gap-3">
+            {/* Framework Switcher */}
+            <div className="flex items-center bg-[#141414] p-1 rounded-xl border border-white/10">
+              <button
+                onClick={() => {
+                  setActiveFramework('flutter');
+                  setActiveFileIdx(0);
+                }}
+                className={`px-3 py-1 text-xs font-semibold rounded-lg transition-all ${
+                  activeFramework === 'flutter'
+                    ? 'bg-[#8B5CF6] text-white shadow-sm'
+                    : 'text-[#888] hover:text-white'
+                }`}
+              >
+                Flutter (Dart)
+              </button>
+              <button
+                onClick={() => {
+                  setActiveFramework('kotlin');
+                  setActiveFileIdx(0);
+                }}
+                className={`px-3 py-1 text-xs font-semibold rounded-lg transition-all ${
+                  activeFramework === 'kotlin'
+                    ? 'bg-white/20 text-white shadow-sm'
+                    : 'text-[#888] hover:text-white'
+                }`}
+              >
+                Kotlin
+              </button>
+            </div>
+
+            <button
+              onClick={onClose}
+              className="p-2.5 rounded-full bg-[#1E1E1E] hover:bg-[#2A2A2A] border border-white/5 text-[#AAA] hover:text-white transition-all active:scale-95"
+            >
+              <X className="w-4.5 h-4.5" />
+            </button>
+          </div>
         </div>
 
         {/* Content layout */}
@@ -51,7 +105,7 @@ export const KotlinSourceViewer: React.FC<KotlinSourceViewerProps> = ({ isOpen, 
             <div className="text-[10px] font-sans font-light uppercase tracking-widest text-[#666] mb-3 px-2">
               Source Directory
             </div>
-            {KOTLIN_FILES.map((file, idx) => {
+            {currentFiles.map((file, idx) => {
               const isActive = idx === activeFileIdx;
               return (
                 <button

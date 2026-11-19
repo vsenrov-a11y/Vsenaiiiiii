@@ -4,6 +4,7 @@ import { X, Play, Globe, User, MessageSquare, Clock, Plus, Users, Search, Check,
 import { SafeImage } from '../common/SafeImage';
 import { useAsset } from '../../utils/fileDb';
 import { PERSONAS } from '../../data/personas';
+import { unlockAudioSystem } from '../../utils/audioHelper';
 
 interface NewSessionScreenProps {
   character: Persona;
@@ -173,6 +174,8 @@ export function NewSessionScreen({
   };
 
   const handleStart = () => {
+    // Unlock iOS Web Audio and media pipeline directly inside this user gesture tap
+    unlockAudioSystem();
     onStart({
       greeting: greetings[selectedGreetingIndex] || '',
       userPersonaId: selectedUserPersonaId,
@@ -203,7 +206,7 @@ export function NewSessionScreen({
       isLight ? 'bg-[#F8F9FA] text-[#1C1C1E]' : 'bg-[#121214] text-white'
     }`}>
       {/* Top Header Navigation */}
-      <header className={`flex items-center justify-between px-5 sm:px-8 py-4 border-b flex-shrink-0 z-10 ${
+      <header className={`flex items-center justify-between px-5 sm:px-8 pb-4 pt-[calc(env(safe-area-inset-top,0px)+1rem)] border-b flex-shrink-0 z-10 transition-colors ${
         isLight 
           ? 'bg-white/80 backdrop-blur-md border-black/[0.08]' 
           : 'bg-[#121214]/80 backdrop-blur-md border-white/[0.08]'
@@ -334,7 +337,10 @@ export function NewSessionScreen({
                 <button
                   key={session.id}
                   type="button"
-                  onClick={() => onResumeChat?.(session.id)}
+                  onClick={() => {
+                    unlockAudioSystem();
+                    onResumeChat?.(session.id);
+                  }}
                   className={`snap-start flex-shrink-0 w-64 sm:w-72 p-4 rounded-2xl border text-left transition-all duration-150 cursor-pointer active:scale-[0.98] ${
                     isLight 
                       ? 'bg-white border-black/[0.08] hover:border-black/20 hover:bg-black/[0.02] shadow-sm' 

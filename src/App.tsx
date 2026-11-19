@@ -1,9 +1,10 @@
 import React, { useState, useEffect, useMemo, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ScreenType, MainTabType, StorageConfig, Persona, ChatMessage, ChatHistory, World } from './types';
-import { getStorageConfig, saveStorageConfig, loadFromIndexedDB, clearIndexedDB, mergeChatHistories, mergePersonas, mergeWorlds, mergeUserPersonas, saveCharacterChatToLocalStorage, clearCharacterChatFromLocalStorage } from './utils/storage';
+import { getStorageConfig, saveStorageConfig, loadFromIndexedDB, clearIndexedDB, mergeChatHistories, mergePersonas, mergeWorlds, mergeUserPersonas, saveCharacterChatToLocalStorage, clearCharacterChatFromLocalStorage, getLastMessageTime } from './utils/storage';
 import { preloadConfigAssets } from './utils/fileDb';
-import { initCloudSync } from './utils/cloudSync';
+import { initCloudSync, deleteChatFromCloud, saveSingleChatToCloud, deleteCharacterFromDatabase, deleteWorldFromDatabase, saveUserPersonaToChat } from './utils/cloudSync';
+import { unlockAudioSystem } from './utils/audioHelper';
 import { PERSONAS } from './data/personas';
 import { WelcomeScreen } from './components/screens/WelcomeScreen';
 import { OnboardingScreen } from './components/screens/OnboardingScreen';
@@ -18,6 +19,7 @@ import { UserPersonaCreator } from './components/screens/UserPersonaCreator';
 import { PremiumChatScreen } from './components/screens/PremiumChatScreen';
 import { GlassDock } from './components/GlassDock';
 import { NewSessionScreen } from './components/screens/NewSessionScreen';
+import { SafeErrorBoundary } from './components/common/SafeErrorBoundary';
 
 export default function App() {
   const [currentScreen, setCurrentScreen] = useState<ScreenType>('welcome');
@@ -28,7 +30,7 @@ export default function App() {
   const [storageConfig, setStorageConfig] = useState<StorageConfig>({
     apiKey: '',
     useServerKeyFallback: true,
-    selectedPersonaId: 'tech-mentor',
+    selectedPersonaId: '',
     customPersonas: [],
     chatHistories: [],
   });
@@ -49,6 +51,47 @@ export default function App() {
   useEffect(() => {
     setVisitedTabs(prev => prev[activeTab] ? prev : { ...prev, [activeTab]: true });
   }, [activeTab]);
+
+  // Synchronize active theme with documentElement, body, and iOS status bar meta tags
+  useEffect(() => {
+    const isLight = storageConfig.theme === 'light';
+    const rootHtml = document.documentElement;
+    const body = document.body;
+    const themeHex = isLight ? '#F8F9FA' : '#0A0A0A';
+    const statusBarStyle = isLight ? 'default' : 'black-translucent';
+
+    if (isLight) {
+      rootHtml.classList.add('theme-light');
+      body.classList.add('theme-light');
+      rootHtml.style.colorScheme = 'light';
+      rootHtml.style.backgroundColor = '#F8F9FA';
+      body.style.backgroundColor = '#F8F9FA';
+    } else {
+      rootHtml.classList.remove('theme-light');
+      body.classList.remove('theme-light');
+      rootHtml.style.colorScheme = 'dark';
+      rootHtml.style.backgroundColor = '#0A0A0A';
+      body.style.backgroundColor = '#0A0A0A';
+    }
+
+    // Update meta theme-color tags for both desktop and iOS Safari
+    let themeMeta = document.querySelector('meta[name="theme-color"]:not([media])') as HTMLMetaElement | null;
+    if (!themeMeta) {
+      themeMeta = document.createElement('meta');
+      themeMeta.name = 'theme-color';
+      document.head.appendChild(themeMeta);
+    }
+    themeMeta.content = themeHex;
+
+    // Update apple-mobile-web-app-status-bar-style
+    let statusBarMeta = document.querySelector('meta[name="apple-mobile-web-app-status-bar-style"]') as HTMLMetaElement | null;
+    if (!statusBarMeta) {
+      statusBarMeta = document.createElement('meta');
+      statusBarMeta.name = 'apple-mobile-web-app-status-bar-style';
+      document.head.appendChild(statusBarMeta);
+    }
+    statusBarMeta.content = statusBarStyle;
+  }, [storageConfig.theme]);
 
   const [chatOrigin, setChatOrigin] = useState<{
     tab: MainTabType;
@@ -113,7 +156,11 @@ export default function App() {
     loadFromIndexedDB().then((idbConfig) => {
       let finalConfig = config;
       if (idbConfig) {
-        const mergedHistories = mergeChatHistories(idbConfig.chatHistories || [], config.chatHistories || []);
+        const deletedChatIds = Array.from(new Set([
+          ...(idbConfig.deletedChatIds || []),
+          ...(config.deletedChatIds || [])
+        ])).filter(id => Boolean(id && typeof id === 'string' && id.trim().length > 0));
+        const mergedHistories = mergeChatHistories(idbConfig.chatHistories || [], config.chatHistories || [], deletedChatIds);
         const mergedCharacters = mergePersonas(idbConfig.characters || [], config.characters || []);
         const mergedCustom = mergePersonas(idbConfig.customPersonas || [], config.customPersonas || []);
         const mergedWorldsList = mergeWorlds(idbConfig.worlds || [], config.worlds || []);
@@ -147,13 +194,45 @@ export default function App() {
     });
 
     // Initialize real-time Cloud Sync with Firestore
-    initCloudSync((cloudConfig) => {
-      setStorageConfig(cloudConfig);
-      preloadConfigAssets(cloudConfig);
-      if (cloudConfig.hasOnboarded || (cloudConfig.chatHistories && cloudConfig.chatHistories.length > 0) || (cloudConfig.characters && cloudConfig.characters.length > 0) || (cloudConfig.worlds && cloudConfig.worlds.length > 0)) {
-        setCurrentScreen((prev) => prev === 'welcome' || prev === 'onboarding' ? 'main' : prev);
+    initCloudSync(
+      (cloudConfig) => {
+        setStorageConfig(cloudConfig);
+        preloadConfigAssets(cloudConfig);
+        if (cloudConfig.hasOnboarded || (cloudConfig.chatHistories && cloudConfig.chatHistories.length > 0) || (cloudConfig.characters && cloudConfig.characters.length > 0) || (cloudConfig.worlds && cloudConfig.worlds.length > 0)) {
+          setCurrentScreen((prev) => prev === 'welcome' || prev === 'onboarding' ? 'main' : prev);
+        }
+      },
+      () => {
+        // Step 2: User has logged out! Reset ALL UI state to blank:
+        console.log("No user active. Resetting app memory...");
+        setActiveChatSessionId(null);
+        setActiveSetupPersona(null);
+        setGlobalProfilePersona(null);
+        setGlobalProfileWorld(null);
+
+        // CRUCIAL: Instantly wipe your UI arrays so old data disappears!
+        setStorageConfig({
+          apiKey: '',
+          apiKeys: [],
+          worldApiKey: '',
+          useSameApiKey: true,
+          useServerKeyFallback: true,
+          selectedPersonaId: '',
+          characters: [],
+          customPersonas: [],
+          worlds: [],
+          userPersonas: [],
+          chatHistories: [],
+          likedPersonaIds: [],
+          likedWorldIds: [],
+          deletedChatIds: [],
+          deletedPersonaIds: [],
+          deletedWorldIds: [],
+          hasOnboarded: false
+        });
+        setCurrentScreen('welcome');
       }
-    }).catch(err => {
+    ).catch(err => {
       console.warn('Cloud sync initialization warning:', err);
     });
   }, []);
@@ -199,11 +278,13 @@ export default function App() {
       setHistoryActiveSection(isWorld ? 'worlds' : 'characters');
       handleUpdateConfig({ selectedPersonaId: session.personaId });
     }
+    unlockAudioSystem();
     setActiveChatSessionId(historyId);
     setActiveTab('history');
   }, [storageConfig.chatHistories, activeTab, chatOrigin, historyActiveSection, handleUpdateConfig]);
 
   const handleEnterWorld = useCallback((worldId: string) => {
+    unlockAudioSystem();
     const persona = allCompanions.find(c => c.id === `world-${worldId}`);
     if (persona) {
       handleUpdateConfig({ activeWorldId: worldId, selectedPersonaId: `world-${worldId}` });
@@ -217,6 +298,7 @@ export default function App() {
   }, [allCompanions, handleUpdateConfig, getExistingSessionForPersona, handleSelectChat]);
   
   const handleSetupWorld = useCallback((worldId: string) => {
+    unlockAudioSystem();
     const persona = allCompanions.find(c => c.id === `world-${worldId}`);
     if (persona) {
       handleUpdateConfig({ activeWorldId: worldId, selectedPersonaId: `world-${worldId}` });
@@ -258,13 +340,14 @@ export default function App() {
   }, []);
 
   const handleOnboardingContinue = useCallback(() => {
+    unlockAudioSystem();
     const updated = saveStorageConfig({ hasOnboarded: true });
     setStorageConfig(updated);
     setCurrentScreen('main');
     setActiveTab('personas');
   }, []);
 
-  const handleSaveHistory = useCallback((historyId: string, messages: ChatMessage[], lastMessageText: string, personaId?: string) => {
+  const handleSaveHistory = useCallback((historyId: string, messages: ChatMessage[], lastMessageText: string, personaId?: string, newDeletedMessageIds?: string[]) => {
     setStorageConfig((prev) => {
       const existingIdx = prev.chatHistories.findIndex((h) => h.id === historyId);
       let updatedHistories = [...prev.chatHistories];
@@ -281,40 +364,92 @@ export default function App() {
         linkedWorldId = targetPid.replace('world-', '');
       }
 
-      if (historyId) {
-        saveCharacterChatToLocalStorage(historyId, messages, pId);
-      } else if (pId) {
-        saveCharacterChatToLocalStorage(pId, messages);
-      }
-
+      let savedSession: ChatHistory;
       if (existingIdx >= 0) {
         const existingSession = updatedHistories[existingIdx];
-        const updatedSession = {
+        const activeUserPersona = (prev.userPersonas || []).find(p => p.id === (existingSession.userPersonaId || prev.activeUserPersonaId)) || prev.userPersonas?.[0];
+        const resolvedName = existingSession.userPersonaName || activeUserPersona?.name || prev.userProfile?.name || 'You';
+        const resolvedAvatar = existingSession.userPersonaAvatar || activeUserPersona?.avatar || prev.userProfile?.avatar;
+        const resolvedDesc = existingSession.userPersonaDesc || activeUserPersona?.description || prev.userProfile?.description;
+        
+        const combinedDeleted = Array.from(new Set([
+          ...(existingSession.deletedMessageIds || []),
+          ...(newDeletedMessageIds || [])
+        ]));
+        const filteredMsgs = (messages || []).filter(m => !combinedDeleted.includes(m.id));
+
+        if (historyId) {
+          saveCharacterChatToLocalStorage(historyId, filteredMsgs, pId);
+        } else if (pId) {
+          saveCharacterChatToLocalStorage(pId, filteredMsgs);
+        }
+
+        const updatedSession: ChatHistory = {
           ...existingSession,
           personaId: personaId || existingSession.personaId || pId,
           personaName: pName || existingSession.personaName,
           linkedWorldId: linkedWorldId || existingSession.linkedWorldId,
-          messages,
+          userPersonaId: existingSession.userPersonaId || activeUserPersona?.id || prev.activeUserPersonaId || 'user',
+          userPersonaName: resolvedName,
+          userPersonaAvatar: resolvedAvatar,
+          userPersonaDesc: resolvedDesc,
+          messages: filteredMsgs,
           lastMessage: lastMessageText,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }),
           updatedAt: Date.now(),
+          lastMessageAt: Date.now(),
+          deletedMessageIds: combinedDeleted,
         };
+        savedSession = updatedSession;
         updatedHistories.splice(existingIdx, 1);
         updatedHistories.unshift(updatedSession);
       } else {
-        updatedHistories.unshift({
+        const activeUserPersona = (prev.userPersonas || []).find(p => p.id === prev.activeUserPersonaId) || prev.userPersonas?.[0];
+        const resolvedName = activeUserPersona?.name || prev.userProfile?.name || 'You';
+        const resolvedAvatar = activeUserPersona?.avatar || prev.userProfile?.avatar;
+        const resolvedDesc = activeUserPersona?.description || prev.userProfile?.description;
+        
+        const combinedDeleted = Array.from(new Set(newDeletedMessageIds || []));
+        const filteredMsgs = (messages || []).filter(m => !combinedDeleted.includes(m.id));
+
+        if (historyId) {
+          saveCharacterChatToLocalStorage(historyId, filteredMsgs, pId);
+        } else if (pId) {
+          saveCharacterChatToLocalStorage(pId, filteredMsgs);
+        }
+
+        const newSession: ChatHistory = {
           id: historyId,
           personaId: pId,
           personaName: pName,
           avatarGradient: pGradient,
           linkedWorldId: linkedWorldId,
-          messages,
+          userPersonaId: activeUserPersona?.id || prev.activeUserPersonaId || '',
+          userPersonaName: resolvedName,
+          userPersonaAvatar: resolvedAvatar,
+          userPersonaDesc: resolvedDesc,
+          messages: filteredMsgs,
           lastMessage: lastMessageText,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false }),
           updatedAt: Date.now(),
+          lastMessageAt: Date.now(),
+          deletedMessageIds: combinedDeleted,
           isArchived: false,
-        });
+        };
+        savedSession = newSession;
+        updatedHistories.unshift(newSession);
       }
+
+      // Sort histories: pinned first, then strictly by newest message time
+      updatedHistories.sort((a, b) => {
+        if (a.isPinned && !b.isPinned) return -1;
+        if (!a.isPinned && b.isPinned) return 1;
+        return getLastMessageTime(b) - getLastMessageTime(a);
+      });
+
+      // Directly sync this single chat to Firestore in background for instantaneous cloud durability
+      saveSingleChatToCloud(savedSession).catch(() => {});
+
       return saveStorageConfig({ chatHistories: updatedHistories, hasOnboarded: true });
     });
   }, [worldCompanions]);
@@ -322,6 +457,9 @@ export default function App() {
   const handleDeleteChat = useCallback((historyId: string, e?: React.MouseEvent) => {
     if (e) e.stopPropagation();
     
+    // Call cloud delete immediately
+    deleteChatFromCloud(historyId).catch(() => {});
+
     setStorageConfig((prev) => {
       const session = prev.chatHistories.find(h => h.id === historyId);
       clearCharacterChatFromLocalStorage(historyId);
@@ -341,7 +479,8 @@ export default function App() {
       const updatedHistories = prev.chatHistories.filter((h) => 
         h.id !== historyId && h.personaId !== historyId && h.linkedWorldId !== historyId
       );
-      return saveStorageConfig({ chatHistories: updatedHistories });
+      const updatedDeleted = Array.from(new Set([...(prev.deletedChatIds || []), historyId]));
+      return saveStorageConfig({ chatHistories: updatedHistories, deletedChatIds: updatedDeleted });
     });
     setActiveChatSessionId(prev => prev === historyId ? null : prev);
   }, []);
@@ -403,6 +542,9 @@ export default function App() {
   }, []);
 
   const handleDeletePersona = useCallback((personaId: string) => {
+    // Delete permanently from Firestore root and user subcollections
+    deleteCharacterFromDatabase(personaId).catch(() => {});
+
     setStorageConfig((prev) => {
       const updatedCustom = prev.customPersonas.filter((p) => p.id !== personaId);
       const updatedCharacters = (prev.characters || []).filter((p) => p.id !== personaId);
@@ -514,12 +656,15 @@ export default function App() {
   }, []);
 
   return (
-    <div className={`w-full h-[100dvh] flex flex-col overflow-hidden font-sans selection:bg-[#E0E0E0] selection:text-[#121214] ${storageConfig.theme === 'light' ? 'bg-[#F8F9FA]' : 'bg-[#0A0A0A]'}`}>
+    <div className={`w-full h-[100dvh] flex flex-col overflow-hidden font-sans selection:bg-[#E0E0E0] selection:text-[#121214] ${storageConfig.theme === 'light' ? 'bg-[#F8F9FA] theme-light' : 'bg-[#0A0A0A]'}`}>
       <div className="flex-1 flex flex-col relative overflow-hidden h-full">
         {currentScreen === 'welcome' && (
           <WelcomeScreen 
             theme={storageConfig.theme ?? 'dark'}
-            onSetUp={() => setCurrentScreen('onboarding')} 
+            onSetUp={() => {
+              unlockAudioSystem();
+              setCurrentScreen('onboarding');
+            }} 
           />
         )}
 
@@ -535,35 +680,58 @@ export default function App() {
           <div className="flex-1 flex flex-col h-full relative overflow-hidden">
             {activeChatSessionId ? (
               /* Active Chat Session Overlay */
-              <PremiumChatScreen
-                key={activeChatSessionId}
-                initialLinkedWorldId={storageConfig.selectedPersonaId?.startsWith('world-') ? storageConfig.selectedPersonaId.replace('world-', '') : undefined}
-                persona={activePersona}
-                apiKey={storageConfig.apiKey}
-                historyId={activeChatSessionId}
-                initialMessages={activeChatSession?.messages}
-                onBack={() => {
-                  setActiveChatSessionId(null);
-                  if (chatOrigin) {
-                    setActiveTab(chatOrigin.tab);
-                    if (chatOrigin.tab === 'history' && chatOrigin.section) {
-                      setHistoryActiveSection(chatOrigin.section);
-                    }
-                    setChatOrigin(null);
+              <SafeErrorBoundary
+                fallbackTitle="Chat Recovered"
+                fallbackSubtitle="The chat interface caught a minor scene state issue and preserved your conversation."
+                onReset={() => {}}
+              >
+                <PremiumChatScreen
+                  key={activeChatSessionId}
+                  initialLinkedWorldId={
+                    activeChatSession?.linkedWorldId || 
+                    (activeChatSession?.personaId?.startsWith('world-') ? activeChatSession.personaId.replace('world-', '') : undefined) ||
+                    (storageConfig.selectedPersonaId?.startsWith('world-') ? storageConfig.selectedPersonaId.replace('world-', '') : undefined)
                   }
-                }}
-                onSaveHistory={handleSaveHistory}
-                isRepliesEnabled={storageConfig.isRepliesEnabled !== false}
-                isHapticEnabled={storageConfig.isHapticEnabled !== false}
-                storageConfig={storageConfig}
-                onResumeChat={handleSelectChat}
-                onUpdateConfig={handleUpdateConfig}
-                theme={storageConfig.theme ?? 'dark'}
-                    onEditPersona={(personaId) => {
-                      setHubEditingPersonaId(personaId);
-                      setHubCreationType('character');
-                    }}
-              />
+                  persona={activePersona}
+                  apiKey={storageConfig.apiKey}
+                  historyId={activeChatSessionId}
+                  initialMessages={activeChatSession?.messages}
+                  onBack={() => {
+                    setActiveChatSessionId(null);
+                    if (chatOrigin) {
+                      setActiveTab(chatOrigin.tab);
+                      if (chatOrigin.tab === 'history' && chatOrigin.section) {
+                        setHistoryActiveSection(chatOrigin.section);
+                      }
+                      setChatOrigin(null);
+                    }
+                  }}
+                  onSaveHistory={handleSaveHistory}
+                  isRepliesEnabled={storageConfig.isRepliesEnabled !== false}
+                  isHapticEnabled={storageConfig.isHapticEnabled !== false}
+                  storageConfig={storageConfig}
+                  onResumeChat={handleSelectChat}
+                  onUpdateConfig={handleUpdateConfig}
+                  onEditPersona={(personaId) => {
+                    setCreationOrigin({
+                      activeTab,
+                      activeChatSessionId,
+                      hubCategory
+                    });
+                    setHubEditingPersonaId(personaId);
+                    setHubCreationType('character');
+                  }}
+                  onEditWorld={(worldId) => {
+                    setCreationOrigin({
+                      activeTab,
+                      activeChatSessionId,
+                      hubCategory
+                    });
+                    setHubEditingPersonaId(worldId);
+                    setHubCreationType('world');
+                  }}
+                />
+              </SafeErrorBoundary>
             ) : (
               /* Screen Tab Switcher */
               <div className="flex-1 flex flex-col h-full overflow-hidden">
@@ -609,6 +777,7 @@ export default function App() {
                       onToggleLikePersona={handleToggleLikePersona}
                       onDeletePersona={handleDeletePersona}
                       onStartChat={(personaId) => {
+                        unlockAudioSystem();
                         setChatOrigin({
                           tab: 'history',
                           section: historyActiveSection
@@ -659,6 +828,7 @@ export default function App() {
                         handleSelectChat(historyId);
                       }}
                       onStartChat={(explicitPersonaId) => {
+                        unlockAudioSystem();
                         const pId = typeof explicitPersonaId === 'string' ? explicitPersonaId : storageConfig.selectedPersonaId;
                         const persona = allCompanions.find(c => c.id === pId);
                         if (persona) {
@@ -784,9 +954,10 @@ export default function App() {
               handleSelectChat(historyId);
             }}
             onStart={(config) => {
+              unlockAudioSystem();
               setActiveSetupPersona(null);
               setActiveChatSessionId(null);
-              const newSessionId = `chat-${Date.now()}`;
+              const newSessionId = `chat-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
               const targetWorldId = config.worldId || (activeSetupPersona.id.startsWith('world-') ? activeSetupPersona.id.replace('world-', '') : undefined);
               const matchedWorld = targetWorldId ? (storageConfig.worlds || []).find(w => w.id === targetWorldId) : null;
               const startingPlace = matchedWorld?.places?.[0]?.name || 'General';
@@ -829,7 +1000,26 @@ export default function App() {
                 }],
                 linkedWorldId: targetWorldId,
                 linkedCharacterIds: resolvedSessionCast,
-                userPersonaId: config.userPersonaId || undefined,
+                userPersonaId: (() => {
+                  const targetId = config.userPersonaId || storageConfig.activeUserPersonaId;
+                  const found = (storageConfig.userPersonas || []).find(p => p.id === targetId);
+                  return found?.id || targetId || 'user';
+                })(),
+                userPersonaName: (() => {
+                  const targetId = config.userPersonaId || storageConfig.activeUserPersonaId;
+                  const found = (storageConfig.userPersonas || []).find(p => p.id === targetId);
+                  return found?.name || storageConfig.userPersonas?.[0]?.name || storageConfig.userProfile?.name || 'You';
+                })(),
+                userPersonaAvatar: (() => {
+                  const targetId = config.userPersonaId || storageConfig.activeUserPersonaId;
+                  const found = (storageConfig.userPersonas || []).find(p => p.id === targetId);
+                  return found?.avatar || storageConfig.userPersonas?.[0]?.avatar || storageConfig.userProfile?.avatar;
+                })(),
+                userPersonaDesc: (() => {
+                  const targetId = config.userPersonaId || storageConfig.activeUserPersonaId;
+                  const found = (storageConfig.userPersonas || []).find(p => p.id === targetId);
+                  return found?.description || storageConfig.userPersonas?.[0]?.description || storageConfig.userProfile?.description;
+                })(),
                 enableSceneDetection: config.enableSceneDetection,
                 activePlaceName: startingPlace,
                 activeAmbientName: startingAmbient
@@ -860,6 +1050,7 @@ export default function App() {
                 onBack={() => setGlobalProfilePersona(null)}
                 disableAnimation={true}
                 onStartChat={(pidParam, forceNew) => {
+                  unlockAudioSystem();
                   const pid = pidParam || (liveProfilePersona || globalProfilePersona).id;
                   setChatOrigin({
                     tab: activeTab,
@@ -888,6 +1079,7 @@ export default function App() {
                   handleDeletePersona(personaId);
                 }}
                 onResumeChat={(historyId) => {
+                  unlockAudioSystem();
                   setChatOrigin({
                     tab: activeTab,
                     section: activeTab === 'history' ? historyActiveSection : undefined
@@ -916,6 +1108,7 @@ export default function App() {
                 onBack={() => setGlobalProfileWorld(null)}
                 disableAnimation={true}
                 onStartChat={(forceNew) => {
+                  unlockAudioSystem();
                   const worldId = (liveProfileWorld || globalProfileWorld).id;
                   setChatOrigin({
                     tab: activeTab,
@@ -944,6 +1137,7 @@ export default function App() {
                 }}
                 onDelete={(worldId) => {
                   setGlobalProfileWorld(null);
+                  deleteWorldFromDatabase(worldId).catch(() => {});
                   const worlds = (storageConfig.worlds || []).filter(w => w.id !== worldId);
                   const histories = (storageConfig.chatHistories || []).filter(h => h.linkedWorldId !== worldId);
                   handleUpdateConfig({ worlds, chatHistories: histories });
@@ -972,13 +1166,29 @@ export default function App() {
             onClose={() => {
               setHubCreationType(null);
               setHubEditingPersonaId(null);
+              if (creationOrigin?.activeChatSessionId) {
+                setActiveChatSessionId(creationOrigin.activeChatSessionId);
+                setActiveTab(creationOrigin.activeTab);
+                setCreationOrigin(null);
+              }
             }}
             onSave={(persona) => {
               handleCreateCustomPersona(persona);
               setHubCreationType(null);
               setHubEditingPersonaId(null);
+              if (creationOrigin?.activeChatSessionId) {
+                setActiveChatSessionId(creationOrigin.activeChatSessionId);
+                setActiveTab(creationOrigin.activeTab);
+                setCreationOrigin(null);
+              }
             }}
-            initialData={hubEditingPersonaId ? [...(storageConfig.customPersonas || []), ...(storageConfig.characters || [])].find(p => p.id === hubEditingPersonaId) : null}
+            onUpdate={(persona) => {
+              handleCreateCustomPersona(persona);
+            }}
+            initialData={hubEditingPersonaId ? (
+              allCompanions.find(p => p.id === hubEditingPersonaId) || 
+              [...(storageConfig.customPersonas || []), ...(storageConfig.characters || [])].find(p => p.id === hubEditingPersonaId)
+            ) : null}
           />
         ) : hubCreationType === 'persona' ? (
           <UserPersonaCreator
@@ -986,11 +1196,25 @@ export default function App() {
             onClose={() => setHubCreationType(null)}
             onSave={(newPersona) => {
               const currentPersonas = storageConfig?.userPersonas || [];
+              const personaWithTs = { ...newPersona, updatedAt: Date.now() };
               const exists = currentPersonas.some(p => p.id === newPersona.id);
               let updatedPersonas = exists
-                ? currentPersonas.map(p => p.id === newPersona.id ? newPersona : p)
-                : [...currentPersonas, newPersona];
+                ? currentPersonas.map(p => p.id === newPersona.id ? personaWithTs : p)
+                : [...currentPersonas, personaWithTs];
               
+              const updatedHistories = (storageConfig?.chatHistories || []).map(h => {
+                if (h.userPersonaId === newPersona.id) {
+                  return {
+                    ...h,
+                    userPersonaName: newPersona.name,
+                    userPersonaAvatar: newPersona.avatar || '',
+                    userPersonaDesc: newPersona.description || '',
+                    updatedAt: Date.now()
+                  };
+                }
+                return h;
+              });
+
               if (newPersona.isDefault) {
                 updatedPersonas = updatedPersonas.map(p => ({
                   ...p,
@@ -998,11 +1222,25 @@ export default function App() {
                 }));
                 handleUpdateConfig({ 
                   userPersonas: updatedPersonas,
-                  activeUserPersonaId: newPersona.id 
+                  activeUserPersonaId: newPersona.id,
+                  chatHistories: updatedHistories
                 });
               } else {
-                handleUpdateConfig({ userPersonas: updatedPersonas });
+                handleUpdateConfig({ 
+                  userPersonas: updatedPersonas,
+                  chatHistories: updatedHistories
+                });
               }
+
+              for (const h of updatedHistories.filter(x => x.userPersonaId === newPersona.id).slice(0, 5)) {
+                saveUserPersonaToChat(h.id, {
+                  id: newPersona.id,
+                  name: newPersona.name,
+                  avatar: newPersona.avatar,
+                  description: newPersona.description
+                }).catch(() => {});
+              }
+
               setHubCreationType(null);
             }}
           />
@@ -1013,6 +1251,11 @@ export default function App() {
             onClose={() => {
               setHubCreationType(null);
               setHubEditingPersonaId(null);
+              if (creationOrigin?.activeChatSessionId) {
+                setActiveChatSessionId(creationOrigin.activeChatSessionId);
+                setActiveTab(creationOrigin.activeTab);
+                setCreationOrigin(null);
+              }
             }}
             onSave={(newWorld) => {
               const currentWorlds = storageConfig?.worlds || [];
@@ -1026,8 +1269,32 @@ export default function App() {
               handleUpdateConfig({ worlds: updatedWorlds });
               setHubCreationType(null);
               setHubEditingPersonaId(null);
+              if (creationOrigin?.activeChatSessionId) {
+                setActiveChatSessionId(creationOrigin.activeChatSessionId);
+                setActiveTab(creationOrigin.activeTab);
+                setCreationOrigin(null);
+              }
             }}
-            initialData={hubEditingPersonaId ? (storageConfig.worlds || []).find(w => w.id === hubEditingPersonaId) : null}
+            onUpdate={(newWorld) => {
+              const currentWorlds = storageConfig?.worlds || [];
+              const exists = currentWorlds.some(w => w.id === newWorld.id);
+              let updatedWorlds;
+              if (exists) {
+                updatedWorlds = currentWorlds.map(w => w.id === newWorld.id ? newWorld : w);
+              } else {
+                updatedWorlds = [...currentWorlds, newWorld];
+              }
+              handleUpdateConfig({ worlds: updatedWorlds });
+            }}
+            initialData={(() => {
+              if (!hubEditingPersonaId) return null;
+              const cleanId = hubEditingPersonaId.replace(/^world-/, '');
+              return (storageConfig.worlds || []).find(w => 
+                w.id === hubEditingPersonaId || 
+                w.id === cleanId || 
+                `world-${w.id}` === hubEditingPersonaId
+              ) || null;
+            })()}
           />
         ) : null}
       </div>

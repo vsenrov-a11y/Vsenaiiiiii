@@ -3,8 +3,16 @@ import { motion, AnimatePresence } from 'motion/react';
 import { 
   MessageSquare, Camera, Image as ImageIcon, Users, Lock, ChevronLeft, Wifi, Battery, Signal, Send, 
   Heart, MapPin, RefreshCw, Upload, ImagePlus, Settings, Palette, Check, Trash2, Smartphone, 
-  FileText, Wallet as WalletIcon, CloudSun, Clock, Music, ChevronUp, LockKeyhole, Sparkles, X, ShieldAlert, Maximize2
+  FileText, Wallet as WalletIcon, CloudSun, Clock, Music, ChevronUp, LockKeyhole, Sparkles, X, ShieldAlert, Maximize2, Globe,
+  Play, Pause, Volume2, VolumeX, Square, Radio, FileAudio
 } from 'lucide-react';
+import { 
+  getPlayableAudioUrl, 
+  unlockAudioSystem, 
+  startSynthesizedAtmosphere, 
+  stopSynthesizedAtmosphere,
+  getGlobalAudioContext
+} from '../../utils/audioHelper';
 import { Persona } from '@/src/types';
 import { SafeImage } from '../common/SafeImage';
 
@@ -74,44 +82,10 @@ export function PhoneInterface({
     ...customContacts
   ];
 
-  // Dynamic Feed Initialization
-  const defaultSocialFeed = [
-    {
-      id: 'post-1',
-      authorId: visiblePersonas[0]?.id || 'char-1',
-      author: visiblePersonas[0]?.name || 'Alice',
-      authorAvatar: visiblePersonas[0]?.socialAvatar || visiblePersonas[0]?.avatar || 'https://images.unsplash.com/photo-1494790108377-be9c29b29330?auto=format&fit=crop&w=150&q=80',
-      content: "Just arrived at the central gardens. The atmosphere here is absolutely ethereal today... 🌸✨ Let's see who else is wandering around.",
-      image: "https://images.unsplash.com/photo-1518531933037-91b2f5f229cc?auto=format&fit=crop&w=600&q=80",
-      timestamp: Date.now() - 3600000 * 2, // 2 hours ago
-      likes: 42,
-      likedByUser: false,
-      comments: [
-        {
-          id: 'c-1',
-          authorId: visiblePersonas[1]?.id || 'char-2',
-          author: visiblePersonas[1]?.name || 'Bob',
-          authorAvatar: visiblePersonas[1]?.socialAvatar || visiblePersonas[1]?.avatar || 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=150&q=80',
-          content: "Looks stunning! Save some of those flowers for the lab.",
-          timestamp: Date.now() - 3600000 * 1.5
-        }
-      ]
-    },
-    {
-      id: 'post-2',
-      authorId: visiblePersonas[1]?.id || 'char-2',
-      author: visiblePersonas[1]?.name || 'Bob',
-      authorAvatar: visiblePersonas[1]?.socialAvatar || visiblePersonas[1]?.avatar || 'https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?auto=format&fit=crop&w=150&q=80',
-      content: "Deep in the archives looking for clues on the temporal shifts. The coffee machine is my only ally right now. ☕⏳",
-      image: "https://images.unsplash.com/photo-1501504905252-473c47e087f8?auto=format&fit=crop&w=600&q=80",
-      timestamp: Date.now() - 3600000 * 5, // 5 hours ago
-      likes: 28,
-      likedByUser: false,
-      comments: []
-    }
-  ];
+  // Dynamic Feed Initialization: Only include explicitly user-created or character-defined posts
+  const defaultSocialFeed: any[] = [];
 
-  // Dynamically resolve the feed, injecting configured character preset posts and filtering out disabled profiles
+  // Dynamically resolve the feed, injecting configured character preset posts only
   const characterPresetPosts = visiblePersonas.flatMap((char: any) => {
     if (char.hasSocialMedia === false) return [];
     const posts = Array.isArray(char.socialPosts) ? char.socialPosts : [];
@@ -123,15 +97,9 @@ export function PhoneInterface({
     }));
   });
 
-  const filteredDefaultFeed = defaultSocialFeed.filter((post: any) => {
-    const author = visiblePersonas.find(p => p.id === post.authorId);
-    if (author && author.hasSocialMedia === false) return false;
-    return true;
-  });
-
   const uniqueInitialFeed = Array.from(
-    new Map([...characterPresetPosts, ...filteredDefaultFeed].map(item => [item.id, item])).values()
-  ).sort((a: any, b: any) => b.timestamp - a.timestamp);
+    new Map([...characterPresetPosts].map((item: any) => [item.id, item])).values()
+  ).sort((a: any, b: any) => (b.timestamp || 0) - (a.timestamp || 0));
 
   const resolvedFeed = socialFeed.length > 0 ? socialFeed : uniqueInitialFeed;
 
@@ -1636,45 +1604,7 @@ export function PhoneInterface({
                                                 setSocialInput('');
                                                 setSocialImage(null);
 
-                                                // Trigger automatic dynamic comment from random linked companion
-                                                setTimeout(() => {
-                                                  const aliveCompanions = visiblePersonas.filter(p => p.id !== 'user' && !deadCharacterIds.has(p.id));
-                                                  if (aliveCompanions.length > 0) {
-                                                    const commenter = aliveCompanions[Math.floor(Math.random() * aliveCompanions.length)];
-                                                    const latestFeed = characterState?.phone?.socialFeed || defaultSocialFeed;
-                                                    
-                                                    const commentsList = [
-                                                      "Wow, this is incredibly fascinating! 😮✨",
-                                                      "Fascinating. The parameters of this world continue to surprise us.",
-                                                      "Absolutely spectacular! Let's talk about this soon.",
-                                                      "I saw this! We should totally explore this further next time.",
-                                                      "This represents a significant development, doesn't it?"
-                                                    ];
-                                                    const randomComment = commentsList[Math.floor(Math.random() * commentsList.length)];
-
-                                                    const feedWithComment = latestFeed.map((p: any) => {
-                                                      if (p.id === newPost.id) {
-                                                        return {
-                                                          ...p,
-                                                          likes: p.likes + 1,
-                                                          comments: [
-                                                            ...p.comments,
-                                                            {
-                                                              id: `c-${Date.now()}`,
-                                                              authorId: commenter.id,
-                                                              author: commenter.name,
-                                                              authorAvatar: commenter.avatar,
-                                                              content: randomComment,
-                                                              timestamp: Date.now()
-                                                            }
-                                                          ]
-                                                        };
-                                                      }
-                                                      return p;
-                                                    });
-                                                    onUpdateCharacterState('phone', 'socialFeed', feedWithComment);
-                                                  }
-                                                }, 3000);
+                                                
                                               }
                                             }}
                                             className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-xl text-[10px] font-bold text-white cursor-pointer shadow-md transition-all active:scale-95"
@@ -1686,7 +1616,16 @@ export function PhoneInterface({
 
                                       {/* Feed Posts List */}
                                       <div className="space-y-3">
-                                        {resolvedFeed.map((post: any, i: number) => {
+                                        {resolvedFeed.length === 0 ? (
+                                          <div className="text-center py-10 px-4 bg-white/[0.02] border border-dashed border-white/10 rounded-2xl space-y-2">
+                                            <Globe className="w-8 h-8 text-white/20 mx-auto" />
+                                            <p className="text-xs font-semibold text-white/60">No social media posts</p>
+                                            <p className="text-[10px] text-white/30 max-w-xs mx-auto">
+                                              Only posts you create or posts implemented on characters will appear here.
+                                            </p>
+                                          </div>
+                                        ) : (
+                                          resolvedFeed.map((post: any, i: number) => {
                                           const isDeadAuthor = post.authorId !== 'user' && deadCharacterIds.has(post.authorId);
                                           const authorContact = [...personas, ...customContacts].find(p => p.id === post.authorId);
 
@@ -1828,33 +1767,7 @@ export function PhoneInterface({
                                                         onUpdateCharacterState('phone', 'socialFeed', updatedFeed);
                                                         setSocialCommentInput(prev => ({ ...prev, [post.id]: '' }));
 
-                                                        // Trigger character reply comment if user commented on character's post
-                                                        if (post.authorId !== 'user' && !isDeadAuthor) {
-                                                          setTimeout(() => {
-                                                            const latestFeed = characterState?.phone?.socialFeed || defaultSocialFeed;
-                                                            const currentPost = latestFeed.find((p: any) => p.id === post.id);
-                                                            if (currentPost) {
-                                                              const replyComment = {
-                                                                id: `c-${Date.now() + 1}`,
-                                                                authorId: post.authorId,
-                                                                author: post.author,
-                                                                authorAvatar: post.authorAvatar,
-                                                                content: `Thank you for commenting, ${userName}! It means so much. ✨❤️`,
-                                                                timestamp: Date.now()
-                                                              };
-                                                              const feedWithReply = latestFeed.map((p: any) => {
-                                                                if (p.id === post.id) {
-                                                                  return {
-                                                                    ...p,
-                                                                    comments: [...(p.comments || []), replyComment]
-                                                                  };
-                                                                }
-                                                                return p;
-                                                              });
-                                                              onUpdateCharacterState('phone', 'socialFeed', feedWithReply);
-                                                            }
-                                                          }, 1500);
-                                                        }
+                                                        
                                                       }
                                                     }}
                                                     className="p-1.5 bg-indigo-600 hover:bg-indigo-500 rounded-lg text-white font-bold cursor-pointer transition-all active:scale-95 flex items-center justify-center border-none"
@@ -1865,66 +1778,79 @@ export function PhoneInterface({
                                               </div>
                                             </div>
                                           );
-                                        })}
+                                        }))}
                                       </div>
                                     </div>
                                   )}
 
                                   {/* 3. DISCOVER TAB */}
-                                  {socialTab === 'discover' && (
-                                    <div className="space-y-3">
-                                      <div className="grid grid-cols-2 gap-2">
-                                        {visiblePersonas.map((char) => {
-                                          const stats = getCharacterStats(char.id);
-                                          const isDead = deadCharacterIds.has(char.id);
-                                          return (
-                                            <div 
-                                              key={char.id} 
-                                              className="p-3 bg-white/[0.03] border border-white/5 rounded-2xl flex flex-col items-center text-center space-y-2"
-                                            >
-                                              <div className="relative">
-                                                <SafeImage 
-                                                  src={char.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=150&q=80'} 
-                                                  referrerPolicy="no-referrer"
-                                                  className={`w-12 h-12 rounded-xl object-cover border border-white/10 ${isDead ? 'grayscale opacity-60' : ''}`} 
-                                                  alt="" 
-                                                />
-                                                {isDead && (
-                                                  <span className="absolute -bottom-1 -right-1 text-xs leading-none">💀</span>
-                                                )}
-                                              </div>
-                                              <div className="min-w-0 w-full">
-                                                <div className="font-bold text-[10px] text-white truncate flex items-center justify-center gap-1">
-                                                  {char.name}
-                                                  {isDead && <span className="text-[8px]">💀</span>}
-                                                </div>
-                                                <div className="text-[7.5px] text-white/40 font-mono truncate">@realm_{char.name.toLowerCase().replace(/[^a-z0-9]/g, '')}</div>
-                                              </div>
+                                  {socialTab === 'discover' && (() => {
+                                    const socialCharacters = visiblePersonas.filter(c => c.hasSocialMedia === true);
+                                    return (
+                                      <div className="space-y-3">
+                                        {socialCharacters.length === 0 ? (
+                                          <div className="text-center py-10 px-4 bg-white/[0.02] border border-dashed border-white/10 rounded-2xl space-y-2">
+                                            <Users className="w-8 h-8 text-white/20 mx-auto" />
+                                            <p className="text-xs font-semibold text-white/60">No character profiles</p>
+                                            <p className="text-[10px] text-white/30 max-w-xs mx-auto">
+                                              Characters only appear here if social media is enabled in their character settings.
+                                            </p>
+                                          </div>
+                                        ) : (
+                                          <div className="grid grid-cols-2 gap-2">
+                                            {socialCharacters.map((char) => {
+                                              const stats = getCharacterStats(char.id);
+                                              const isDead = deadCharacterIds.has(char.id);
+                                              return (
+                                                <div 
+                                                  key={char.id} 
+                                                  className="p-3 bg-white/[0.03] border border-white/5 rounded-2xl flex flex-col items-center text-center space-y-2"
+                                                >
+                                                  <div className="relative">
+                                                    <SafeImage 
+                                                      src={char.avatar || 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?auto=format&fit=crop&w=150&q=80'} 
+                                                      referrerPolicy="no-referrer"
+                                                      className={`w-12 h-12 rounded-xl object-cover border border-white/10 ${isDead ? 'grayscale opacity-60' : ''}`} 
+                                                      alt="" 
+                                                    />
+                                                    {isDead && (
+                                                      <span className="absolute -bottom-1 -right-1 text-xs leading-none">💀</span>
+                                                    )}
+                                                  </div>
+                                                  <div className="min-w-0 w-full">
+                                                    <div className="font-bold text-[10px] text-white truncate flex items-center justify-center gap-1">
+                                                      {char.name}
+                                                      {isDead && <span className="text-[8px]">💀</span>}
+                                                    </div>
+                                                    <div className="text-[7.5px] text-white/40 font-mono truncate">@realm_{char.name.toLowerCase().replace(/[^a-z0-9]/g, '')}</div>
+                                                  </div>
 
-                                              <div className="flex gap-2 text-[8px] text-white/50 w-full justify-around pt-1 border-t border-white/5">
-                                                <div>
-                                                  <div className="font-bold text-white/80">{stats.followers}</div>
-                                                  <div>Followers</div>
-                                                </div>
-                                                <div>
-                                                  <div className="font-bold text-white/80">{stats.likes}</div>
-                                                  <div>Likes</div>
-                                                </div>
-                                              </div>
+                                                  <div className="flex gap-2 text-[8px] text-white/50 w-full justify-around pt-1 border-t border-white/5">
+                                                    <div>
+                                                      <div className="font-bold text-white/80">{stats.followers}</div>
+                                                      <div>Followers</div>
+                                                    </div>
+                                                    <div>
+                                                      <div className="font-bold text-white/80">{stats.likes}</div>
+                                                      <div>Likes</div>
+                                                    </div>
+                                                  </div>
 
-                                              <button
-                                                type="button"
-                                                onClick={() => { setSelectedSocialProfile(char.id); }}
-                                                className="w-full py-1 bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 rounded-lg text-[9px] font-bold text-white transition-all cursor-pointer"
-                                              >
-                                                View Profile
-                                              </button>
-                                            </div>
-                                          );
-                                        })}
+                                                  <button
+                                                    type="button"
+                                                    onClick={() => { setSelectedSocialProfile(char.id); }}
+                                                    className="w-full py-1 bg-white/[0.04] hover:bg-white/[0.08] border border-white/10 rounded-lg text-[9px] font-bold text-white transition-all cursor-pointer"
+                                                  >
+                                                    View Profile
+                                                  </button>
+                                                </div>
+                                              );
+                                            })}
+                                          </div>
+                                        )}
                                       </div>
-                                    </div>
-                                  )}
+                                    );
+                                  })()}
 
                                   {/* 4. MY PROFILE TAB */}
                                   {socialTab === 'myprofile' && (() => {
@@ -2194,11 +2120,7 @@ export function PhoneInterface({
 
                       {/* MUSIC APP */}
                       {activeApp === 'Music' && (
-                        <div className="p-6 text-center space-y-3">
-                          <Music className="w-12 h-12 text-rose-500 mx-auto animate-bounce" />
-                          <div className="text-xs font-bold text-white uppercase tracking-widest">Ambient Frequencies</div>
-                          <div className="text-[11px] text-white/50">Playing active atmospheric background track...</div>
-                        </div>
+                        <PhoneMusicPlayerApp />
                       )}
 
                     </div>
@@ -2380,5 +2302,342 @@ function GlobalMessageComposer({ onSend, onClose }: { onSend: (text: string, ima
         </div>
       </div>
     </motion.div>
+  );
+}
+
+function PhoneMusicPlayerApp() {
+  const [activeTab, setActiveTab] = useState<'presets' | 'custom'>('presets');
+  const [activeSynthesized, setActiveSynthesized] = useState<string | null>(null);
+  const atmosphereRef = React.useRef<{ stop: () => void; setVolume: (v: number) => void } | null>(null);
+
+  const [customUrl, setCustomUrl] = useState<string>('https://cdn.freesound.org/previews/316/316844_4939433-lq.mp3');
+  const [isPlayingCustom, setIsPlayingCustom] = useState<boolean>(false);
+  const [customTrackName, setCustomTrackName] = useState<string>('Sample MP3 Stream');
+  const [volume, setVolume] = useState<number>(0.7);
+  const [currentTime, setCurrentTime] = useState<number>(0);
+  const [duration, setDuration] = useState<number>(0);
+  const [statusMsg, setStatusMsg] = useState<string | null>(null);
+
+  const audioRef = React.useRef<HTMLAudioElement | null>(null);
+
+  React.useEffect(() => {
+    return () => {
+      if (atmosphereRef.current) {
+        atmosphereRef.current.stop();
+        atmosphereRef.current = null;
+      }
+      if (audioRef.current) {
+        audioRef.current.pause();
+        audioRef.current = null;
+      }
+    };
+  }, []);
+
+  const handleToggleSynthesized = (preset: 'rain' | 'forest' | 'waves' | 'space') => {
+    if (audioRef.current) {
+      audioRef.current.pause();
+      setIsPlayingCustom(false);
+    }
+
+    if (activeSynthesized === preset) {
+      if (atmosphereRef.current) {
+        atmosphereRef.current.stop();
+        atmosphereRef.current = null;
+      }
+      setActiveSynthesized(null);
+    } else {
+      if (atmosphereRef.current) {
+        atmosphereRef.current.stop();
+      }
+      unlockAudioSystem();
+      const instance = startSynthesizedAtmosphere(preset, volume);
+      atmosphereRef.current = instance;
+      setActiveSynthesized(preset);
+      setStatusMsg(`Playing ${preset} atmosphere`);
+    }
+  };
+
+  const handleToggleCustomPlay = async () => {
+    if (activeSynthesized && atmosphereRef.current) {
+      atmosphereRef.current.stop();
+      atmosphereRef.current = null;
+      setActiveSynthesized(null);
+    }
+
+    if (!audioRef.current) {
+      const audio = new Audio();
+      audio.preload = 'auto';
+      audio.setAttribute('playsinline', 'true');
+      audio.setAttribute('webkit-playsinline', 'true');
+      audio.crossOrigin = 'anonymous';
+
+      audio.addEventListener('loadedmetadata', () => setDuration(audio.duration || 0));
+      audio.addEventListener('timeupdate', () => setCurrentTime(audio.currentTime || 0));
+      audio.addEventListener('ended', () => setIsPlayingCustom(false));
+      audio.addEventListener('error', () => {
+        setIsPlayingCustom(false);
+        setStatusMsg('Error loading MP3 audio file');
+      });
+
+      audioRef.current = audio;
+    }
+
+    const audio = audioRef.current;
+    if (isPlayingCustom) {
+      audio.pause();
+      setIsPlayingCustom(false);
+      setStatusMsg('Paused');
+      return;
+    }
+
+    const playable = getPlayableAudioUrl(customUrl.trim());
+    if (!playable) {
+      setStatusMsg('Invalid audio URL');
+      return;
+    }
+
+    audio.src = playable;
+    audio.volume = volume;
+
+    await unlockAudioSystem([audio]);
+    try {
+      const ctx = getGlobalAudioContext();
+      if (ctx && ctx.state === 'suspended') await ctx.resume();
+      await audio.play();
+      setIsPlayingCustom(true);
+      setStatusMsg(`Playing: ${customTrackName}`);
+    } catch (err: any) {
+      setIsPlayingCustom(false);
+      setStatusMsg(`Playback error: ${err?.message || 'Gesture required'}`);
+    }
+  };
+
+  const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const fileUrl = URL.createObjectURL(file);
+    setCustomUrl(fileUrl);
+    setCustomTrackName(file.name);
+    setStatusMsg(`Loaded MP3 file: ${file.name}`);
+
+    if (activeSynthesized && atmosphereRef.current) {
+      atmosphereRef.current.stop();
+      atmosphereRef.current = null;
+      setActiveSynthesized(null);
+    }
+
+    if (!audioRef.current) {
+      const audio = new Audio();
+      audio.preload = 'auto';
+      audio.setAttribute('playsinline', 'true');
+      audio.setAttribute('webkit-playsinline', 'true');
+
+      audio.addEventListener('loadedmetadata', () => setDuration(audio.duration || 0));
+      audio.addEventListener('timeupdate', () => setCurrentTime(audio.currentTime || 0));
+      audio.addEventListener('ended', () => setIsPlayingCustom(false));
+
+      audioRef.current = audio;
+    }
+
+    const audio = audioRef.current;
+    audio.src = fileUrl;
+    audio.volume = volume;
+
+    unlockAudioSystem([audio]).then(() => {
+      audio.play().then(() => {
+        setIsPlayingCustom(true);
+        setStatusMsg(`Playing: ${file.name}`);
+      }).catch((err) => {
+        setStatusMsg(`Playback blocked: ${err.message}`);
+      });
+    });
+  };
+
+  const formatTime = (sec: number) => {
+    if (isNaN(sec) || !isFinite(sec)) return '0:00';
+    const m = Math.floor(sec / 60);
+    const s = Math.floor(sec % 60);
+    return `${m}:${s < 10 ? '0' : ''}${s}`;
+  };
+
+  return (
+    <div className="p-3.5 space-y-3.5 font-sans">
+      {/* Header */}
+      <div className="flex items-center justify-between px-1">
+        <div className="flex items-center gap-2">
+          <div className="w-8 h-8 rounded-xl bg-gradient-to-br from-rose-500 to-pink-600 flex items-center justify-center text-white shadow-md">
+            <Music className="w-4 h-4" />
+          </div>
+          <div>
+            <div className="font-extrabold text-xs text-white">Vsen Music Player</div>
+            <div className="text-[9px] text-white/50">MP3 & Ambient Soundscapes</div>
+          </div>
+        </div>
+      </div>
+
+      {/* Sub tabs */}
+      <div className="flex bg-black/20 rounded-xl p-1 border border-white/10">
+        <button
+          type="button"
+          onClick={() => setActiveTab('presets')}
+          className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
+            activeTab === 'presets' ? 'bg-rose-600 text-white shadow-sm' : 'text-white/50 hover:text-white'
+          }`}
+        >
+          Ambient Presets
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab('custom')}
+          className={`flex-1 py-1.5 rounded-lg text-[10px] font-bold transition-all cursor-pointer ${
+            activeTab === 'custom' ? 'bg-rose-600 text-white shadow-sm' : 'text-white/50 hover:text-white'
+          }`}
+        >
+          My MP3 Tracks
+        </button>
+      </div>
+
+      {/* Visualizer animation when playing */}
+      {(activeSynthesized || isPlayingCustom) && (
+        <div className="p-3 bg-rose-950/20 border border-rose-500/30 rounded-2xl flex flex-col items-center gap-2">
+          <div className="flex items-end gap-1 h-8 px-2">
+            {Array.from({ length: 18 }).map((_, i) => (
+              <div
+                key={i}
+                className="w-1.5 bg-rose-500 rounded-full animate-pulse"
+                style={{
+                  height: `${Math.max(20, Math.sin(i * 0.6 + Date.now() * 0.005) * 100)}%`,
+                  animationDuration: `${0.4 + (i % 5) * 0.15}s`
+                }}
+              />
+            ))}
+          </div>
+          <span className="text-[10px] font-bold text-rose-300 animate-pulse">
+            {activeSynthesized ? `Playing ${activeSynthesized.toUpperCase()} Soundscape` : `Playing ${customTrackName}`}
+          </span>
+        </div>
+      )}
+
+      {/* Presets Tab */}
+      {activeTab === 'presets' && (
+        <div className="grid grid-cols-2 gap-2">
+          {[
+            { id: 'rain', name: 'Rainstorm', icon: '🌧️' },
+            { id: 'waves', name: 'Ocean Waves', icon: '🌊' },
+            { id: 'forest', name: 'Forest Wind', icon: '🌲' },
+            { id: 'space', name: 'Cosmic Drone', icon: '🌌' },
+          ].map((preset) => {
+            const isPlaying = activeSynthesized === preset.id;
+            return (
+              <button
+                key={preset.id}
+                type="button"
+                onClick={() => handleToggleSynthesized(preset.id as any)}
+                className={`p-3 rounded-xl border flex items-center justify-between gap-2 transition-all cursor-pointer ${
+                  isPlaying
+                    ? 'bg-rose-600/30 border-rose-500/60 shadow-md text-white'
+                    : 'bg-white/[0.03] border-white/10 hover:bg-white/[0.08] text-white/80'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  <span className="text-base">{preset.icon}</span>
+                  <span className="text-[10px] font-bold">{preset.name}</span>
+                </div>
+                {isPlaying ? <Square className="w-3.5 h-3.5 text-rose-400 fill-current" /> : <Play className="w-3.5 h-3.5 text-white/60 fill-current" />}
+              </button>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Custom MP3 Tab */}
+      {activeTab === 'custom' && (
+        <div className="space-y-2.5">
+          <div className="p-3 bg-white/[0.03] border border-white/10 rounded-2xl space-y-2">
+            <div className="text-[10px] font-bold text-white/60 uppercase tracking-wider">Play Local MP3 Audio File</div>
+            <label className="py-2 px-3 bg-rose-600 hover:bg-rose-500 text-white rounded-xl text-xs font-bold flex items-center justify-center gap-2 cursor-pointer transition-all active:scale-95 shadow-md">
+              <Upload className="w-3.5 h-3.5" />
+              <span>Choose MP3 File from Device</span>
+              <input
+                type="file"
+                accept="audio/*,.mp3,.wav,.m4a"
+                onChange={handleFileUpload}
+                className="hidden"
+              />
+            </label>
+          </div>
+
+          <div className="p-3 bg-white/[0.03] border border-white/10 rounded-2xl space-y-2">
+            <div className="text-[10px] font-bold text-white/60 uppercase tracking-wider">Stream MP3 URL</div>
+            <div className="flex gap-2">
+              <input
+                type="text"
+                value={customUrl}
+                onChange={(e) => setCustomUrl(e.target.value)}
+                placeholder="Enter https://... MP3 link"
+                className="flex-1 bg-black/40 border border-white/10 rounded-xl px-2.5 py-1.5 text-[10px] font-mono text-white focus:outline-none focus:border-rose-500/50"
+              />
+              <button
+                type="button"
+                onClick={handleToggleCustomPlay}
+                className="px-3 py-1.5 bg-rose-600 hover:bg-rose-500 text-white font-bold rounded-xl text-[10px] cursor-pointer active:scale-95 transition-all flex items-center gap-1"
+              >
+                {isPlayingCustom ? <Pause className="w-3 h-3 fill-current" /> : <Play className="w-3 h-3 fill-current" />}
+                <span>{isPlayingCustom ? 'Pause' : 'Play'}</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Timeline scrubber if custom audio loaded */}
+          {duration > 0 && (
+            <div className="p-2.5 bg-black/30 border border-white/10 rounded-xl space-y-1">
+              <div className="flex justify-between text-[9px] font-mono text-white/60">
+                <span>{formatTime(currentTime)}</span>
+                <span>{formatTime(duration)}</span>
+              </div>
+              <input
+                type="range"
+                min={0}
+                max={duration}
+                value={currentTime}
+                onChange={(e) => {
+                  const val = parseFloat(e.target.value);
+                  setCurrentTime(val);
+                  if (audioRef.current) audioRef.current.currentTime = val;
+                }}
+                className="w-full h-1 bg-white/20 rounded-lg accent-rose-500 cursor-pointer"
+              />
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Volume Bar */}
+      <div className="p-2.5 bg-white/[0.02] border border-white/10 rounded-xl flex items-center gap-3">
+        <Volume2 className="w-3.5 h-3.5 text-rose-400 flex-shrink-0" />
+        <input
+          type="range"
+          min={0}
+          max={1}
+          step={0.05}
+          value={volume}
+          onChange={(e) => {
+            const v = parseFloat(e.target.value);
+            setVolume(v);
+            if (atmosphereRef.current) atmosphereRef.current.setVolume(v);
+            if (audioRef.current) audioRef.current.volume = v;
+          }}
+          className="w-full h-1 bg-white/20 rounded-lg accent-rose-500 cursor-pointer"
+        />
+        <span className="text-[9px] font-mono text-white/60 w-8 text-right">{Math.round(volume * 100)}%</span>
+      </div>
+
+      {statusMsg && (
+        <div className="text-[9.5px] font-mono text-center text-rose-300/80 bg-rose-950/20 py-1 px-2 rounded-lg border border-rose-500/20 truncate">
+          {statusMsg}
+        </div>
+      )}
+    </div>
   );
 }

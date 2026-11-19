@@ -50,11 +50,16 @@
       "type": "object",
       "properties": {
         "id": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "userId": { "type": "string" },
+        "characterId": { "type": "string" },
+        "characterName": { "type": "string" },
         "personaId": { "type": "string" },
         "timestamp": { "type": "string" },
+        "createdAt": { "type": "object" },
         "updatedAt": { "type": "number" }
       },
-      "required": ["id", "personaId"]
+      "required": ["id"]
     },
     "Asset": {
       "title": "Asset",
@@ -66,6 +71,20 @@
         "updatedAt": { "type": "number" }
       },
       "required": ["id", "data"]
+    },
+    "ChatMessage": {
+      "title": "ChatMessage",
+      "description": "Individual message document in a chat subcollection",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "text": { "type": "string" },
+        "senderId": { "type": "string" },
+        "role": { "type": "string" },
+        "isUser": { "type": "boolean" },
+        "timestamp": { "type": "object" }
+      },
+      "required": ["text"]
     }
   },
   "firestore": {
@@ -85,9 +104,29 @@
       "schema": { "$ref": "#/entities/ChatSession" },
       "description": "User chat sessions collection"
     },
+    "/users/{userId}/chats/{chatId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "Individual messages in user chat subcollection"
+    },
     "/users/{userId}/assets/{assetId}": {
       "schema": { "$ref": "#/entities/Asset" },
       "description": "User uploaded assets collection"
+    },
+    "/characters/{charId}": {
+      "schema": { "$ref": "#/entities/Character" },
+      "description": "Direct characters collection"
+    },
+    "/worlds/{worldId}": {
+      "schema": { "$ref": "#/entities/World" },
+      "description": "Direct worlds collection"
+    },
+    "/chats/{chatId}": {
+      "schema": { "$ref": "#/entities/ChatSession" },
+      "description": "Direct chat sessions collection"
+    },
+    "/chats/{chatId}/messages/{messageId}": {
+      "schema": { "$ref": "#/entities/ChatMessage" },
+      "description": "Individual messages in chat subcollection"
     }
   }
 }

@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { World, ChatHistory, StorageConfig } from '../../types';
+import { getLastMessageTime } from '../../utils/storage';
+import { getValidPreviewMessage, renderCardPreviewText } from '../../utils/cardTextHelper';
 import { SafeImage } from '../common/SafeImage';
 import { getRealWorldDefaultCalendar } from '../../utils/calendarHelper';
 import { 
@@ -62,17 +64,13 @@ export function WorldProfileScreen({
 
   const isLiked = likedWorldIds.includes(world.id);
   const chatSessions = (storageConfig.chatHistories || []).filter(h => (h.linkedWorldId === world.id || h.personaId === `world-${world.id}`) && !h.isArchived);
-  const sortedSessions = [...chatSessions].sort((a, b) => {
-    const timeA = (typeof a.updatedAt === 'number' && !isNaN(a.updatedAt)) ? a.updatedAt : (a.timestamp ? new Date(a.timestamp).getTime() || 0 : 0);
-    const timeB = (typeof b.updatedAt === 'number' && !isNaN(b.updatedAt)) ? b.updatedAt : (b.timestamp ? new Date(b.timestamp).getTime() || 0 : 0);
-    return timeB - timeA;
-  });
+  const sortedSessions = [...chatSessions].sort((a, b) => getLastMessageTime(b) - getLastMessageTime(a));
   const mostRecentSession = sortedSessions[0] || null;
   const hasExperience = chatSessions.length > 0 && chatSessions.some(s => s.messages && s.messages.length > 0);
 
   const messageCount = chatSessions.reduce((acc, session) => acc + (session.messages?.length || 0), 0);
   
-  const mostRecentTimestamp = sortedSessions[0]?.updatedAt || (sortedSessions[0]?.timestamp ? new Date(sortedSessions[0].timestamp).getTime() : 0);
+  const mostRecentTimestamp = getLastMessageTime(sortedSessions[0]);
   const lastConversationDate = mostRecentTimestamp ? new Date(mostRecentTimestamp) : null;
   const isLight = storageConfig?.theme === 'light';
 
@@ -218,7 +216,7 @@ export function WorldProfileScreen({
       {/* FIXED HEADER UPPER HALF BLOCK */}
       <div className="flex-shrink-0">
         {/* Header Profile Cover Accent & Back Action */}
-        <div className="relative w-full pt-4 px-4 pb-2 flex-shrink-0">
+        <div className="relative w-full pt-[calc(env(safe-area-inset-top,0px)+1rem)] px-4 pb-2 flex-shrink-0">
           <div className="flex items-center justify-between z-20 relative">
             <button
               onClick={onBack}
@@ -408,7 +406,7 @@ export function WorldProfileScreen({
               World Environment & Dynamics
             </h3>
 
-            <div className="grid grid-cols-2 gap-2 text-[11px] font-sans">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 text-[11px] font-sans">
               <div className={`p-2.5 rounded-xl border ${isLight ? 'bg-black/[0.02] border-black/5' : 'bg-white/[0.02] border-white/5'}`}>
                 <span className={`text-[9px] font-bold uppercase tracking-wider block mb-0.5 ${isLight ? 'text-black/40' : 'text-white/40'}`}>Atmosphere</span>
                 <span className={`font-semibold ${isLight ? 'text-black' : 'text-white'}`}>{world.defaultAtmosphere || 'Clear & Vibrant'}</span>
@@ -420,10 +418,6 @@ export function WorldProfileScreen({
               <div className={`p-2.5 rounded-xl border ${isLight ? 'bg-black/[0.02] border-black/5' : 'bg-white/[0.02] border-white/5'}`}>
                 <span className={`text-[9px] font-bold uppercase tracking-wider block mb-0.5 ${isLight ? 'text-black/40' : 'text-white/40'}`}>Starting Location</span>
                 <span className={`font-semibold ${isLight ? 'text-black' : 'text-white'}`}>{world.defaultLocation || (world.places?.[0]?.name) || 'Central Hub'}</span>
-              </div>
-              <div className={`p-2.5 rounded-xl border ${isLight ? 'bg-black/[0.02] border-black/5' : 'bg-white/[0.02] border-white/5'}`}>
-                <span className={`text-[9px] font-bold uppercase tracking-wider block mb-0.5 ${isLight ? 'text-black/40' : 'text-white/40'}`}>Initial Reputation</span>
-                <span className={`font-semibold ${isLight ? 'text-black' : 'text-white'}`}>{world.defaultReputation || 'Neutral Citizen'}</span>
               </div>
             </div>
 
@@ -441,14 +435,14 @@ export function WorldProfileScreen({
               </div>
             )}
 
-            {/* Ambient Soundscapes Cloud */}
+            {/* Ambient Videos Cloud */}
             {world.ambientSounds && world.ambientSounds.length > 0 && (
               <div className="mt-3">
-                <span className={`text-[9px] font-bold uppercase tracking-wider block mb-1.5 ${isLight ? 'text-black/40' : 'text-white/40'}`}>Soundscapes ({world.ambientSounds.length})</span>
+                <span className={`text-[9px] font-bold uppercase tracking-wider block mb-1.5 ${isLight ? 'text-black/40' : 'text-white/40'}`}>Background Videos ({world.ambientSounds.length})</span>
                 <div className="flex flex-wrap gap-1.5">
                   {world.ambientSounds.map((sound, i) => (
                     <span key={i} className={`px-2.5 py-1 rounded-lg border text-[10px] font-medium ${isLight ? 'bg-black/5 border-black/10 text-black/80' : 'bg-white/5 border-white/10 text-white/80'}`}>
-                      🎵 {sound.name}
+                      🎥 {sound.name}
                     </span>
                   ))}
                 </div>
@@ -602,7 +596,7 @@ export function WorldProfileScreen({
                         </span>
                       </div>
                       <p className={`text-[11px] font-sans line-clamp-1 leading-snug ${isLight ? 'text-black/70' : 'text-white/80'}`}>
-                        {session.messages?.[session.messages.length - 1]?.text || 'No messages yet...'}
+                        {renderCardPreviewText(getValidPreviewMessage(session), isLight)}
                       </p>
                     </button>
                   );
@@ -654,7 +648,7 @@ export function WorldProfileScreen({
                 </div>
               </button>
 
-              {chatSessions.sort((a, b) => new Date(b.updatedAt || b.timestamp).getTime() - new Date(a.updatedAt || a.timestamp).getTime()).map(session => (
+              {chatSessions.sort((a, b) => getLastMessageTime(b) - getLastMessageTime(a)).map(session => (
                 <button
                   key={session.id}
                   onClick={() => {
@@ -676,7 +670,7 @@ export function WorldProfileScreen({
                     </span>
                   </div>
                   <p className={`text-sm font-sans line-clamp-2 ${isLight ? 'text-black' : 'text-white/90'}`}>
-                    {session.messages?.[session.messages.length - 1]?.text || 'No messages yet...'}
+                    {renderCardPreviewText(getValidPreviewMessage(session), isLight)}
                   </p>
                 </button>
               ))}

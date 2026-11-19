@@ -26,10 +26,11 @@ interface CharacterCreatorProps {
   isLight: boolean;
   onClose: () => void;
   onSave: (persona: Persona) => void;
+  onUpdate?: (persona: Persona) => void;
   initialData?: Persona | null;
 }
 
-export function CharacterCreator({ isLight, onClose, onSave, initialData }: CharacterCreatorProps) {
+export function CharacterCreator({ isLight, onClose, onSave, onUpdate, initialData }: CharacterCreatorProps) {
   const isEdit = !!initialData;
   const [step, setStep] = useState(1);
   
@@ -930,8 +931,17 @@ export function CharacterCreator({ isLight, onClose, onSave, initialData }: Char
         </AnimatePresence>
 
         {/* Header: back arrow, "Edit Character" title, and a "Save" button in the top-right corner. */}
-        <div className={`px-4 py-3 flex items-center justify-between relative border-b ${isLight ? 'text-black border-black/5 bg-[#F8F9FA]' : 'text-white border-white/5 bg-[#0f0f10]'}`}>
-          <button onClick={onClose} className={`p-2 -ml-2 rounded-full transition-colors ${isLight ? 'bg-black/5 hover:bg-black/10' : 'bg-white/5 hover:bg-white/10'}`}>
+        <div className={`px-4 pb-3 pt-[calc(env(safe-area-inset-top,0px)+0.75rem)] flex items-center justify-between relative border-b transition-colors ${isLight ? 'text-black border-black/5 bg-[#F8F9FA]' : 'text-white border-white/5 bg-[#0f0f10]'}`}>
+          <button 
+            onClick={() => {
+              if (isEdit && name.trim()) {
+                handleCreate();
+              } else {
+                onClose();
+              }
+            }} 
+            className={`p-2 -ml-2 rounded-full transition-colors ${isLight ? 'bg-black/5 hover:bg-black/10' : 'bg-white/5 hover:bg-white/10'}`}
+          >
             <ArrowLeft className="w-5 h-5" />
           </button>
           <h2 className="text-[17px] font-semibold text-center flex-1 pr-4">Edit Character</h2>
@@ -1351,7 +1361,7 @@ export function CharacterCreator({ isLight, onClose, onSave, initialData }: Char
       </AnimatePresence>
 
       {/* Header */}
-      <div className={`px-4 py-3 flex items-center justify-center relative ${isLight ? 'text-black' : 'text-white'}`}>
+      <div className={`px-4 pb-3 pt-[calc(env(safe-area-inset-top,0px)+0.75rem)] flex items-center justify-center relative transition-colors ${isLight ? 'text-black' : 'text-white'}`}>
         {step === 1 ? (
           <button onClick={onClose} className={`absolute left-4 p-2 -ml-2 rounded-full transition-colors ${isLight ? 'bg-black/5 hover:bg-black/10' : 'bg-white/5 hover:bg-white/10'}`}>
             <X className="w-5 h-5" />

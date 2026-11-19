@@ -3,6 +3,7 @@ import { motion, AnimatePresence } from 'motion/react';
 import { Persona, StorageConfig, World } from '../../types';
 import { PERSONAS } from '../../data/personas';
 import { SafeImage } from '../common/SafeImage';
+import { getLastMessageTime } from '../../utils/storage';
 import { storeAsset } from '../../utils/fileDb';
 import { CharacterProfileScreen } from './CharacterProfileScreen';
 import { CharacterCreator } from './CharacterCreator';
@@ -209,12 +210,11 @@ const getLastChattedTime = (personaId: string, histories: any[] = []) => {
   const matchingHistories = histories.filter(h => h.personaId === personaId);
   if (matchingHistories.length === 0) return null;
   
-  const getSessionTime = (h: any) => h.updatedAt || parseInt(h.id?.split('-')[1]) || 0;
-  const sorted = [...matchingHistories].sort((a, b) => getSessionTime(b) - getSessionTime(a));
+  const sorted = [...matchingHistories].sort((a, b) => getLastMessageTime(b) - getLastMessageTime(a));
   
   const lastHistory = sorted[0];
   if (!lastHistory) return null;
-  const lastTime = getSessionTime(lastHistory);
+  const lastTime = getLastMessageTime(lastHistory);
   if (!lastTime) return "chatted recently";
   
   const diffMs = Date.now() - lastTime;
@@ -505,7 +505,8 @@ export const PersonaHubScreen: React.FC<PersonaHubScreenProps> = React.memo(({
         },
         body: JSON.stringify({
           prompt: `${avatarDescription.trim()}. Portrait, cinematic lighting, highly detailed avatar.`,
-          customApiKey: customApiKey
+          customApiKey: customApiKey,
+          customApiKeys: storageConfig?.apiKeys
         })
       });
 
@@ -800,8 +801,25 @@ export const PersonaHubScreen: React.FC<PersonaHubScreenProps> = React.memo(({
           onSave={(newPersona) => {
             if (onUpdateConfig) {
               const currentPersonas = storageConfig?.userPersonas || [];
-              let updatedPersonas = [...currentPersonas, newPersona];
+              const personaWithTs = { ...newPersona, updatedAt: Date.now() };
+              const exists = currentPersonas.some(p => p.id === newPersona.id);
+              let updatedPersonas = exists
+                ? currentPersonas.map(p => p.id === newPersona.id ? personaWithTs : p)
+                : [...currentPersonas, personaWithTs];
               
+              const updatedHistories = (storageConfig?.chatHistories || []).map(h => {
+                if (h.userPersonaId === newPersona.id) {
+                  return {
+                    ...h,
+                    userPersonaName: newPersona.name,
+                    userPersonaAvatar: newPersona.avatar || '',
+                    userPersonaDesc: newPersona.description || '',
+                    updatedAt: Date.now()
+                  };
+                }
+                return h;
+              });
+
               if (newPersona.isDefault) {
                 updatedPersonas = updatedPersonas.map(p => ({
                   ...p,
@@ -809,10 +827,14 @@ export const PersonaHubScreen: React.FC<PersonaHubScreenProps> = React.memo(({
                 }));
                 onUpdateConfig({ 
                   userPersonas: updatedPersonas,
-                  activeUserPersonaId: newPersona.id 
+                  activeUserPersonaId: newPersona.id,
+                  chatHistories: updatedHistories
                 });
               } else {
-                onUpdateConfig({ userPersonas: updatedPersonas });
+                onUpdateConfig({ 
+                  userPersonas: updatedPersonas,
+                  chatHistories: updatedHistories
+                });
               }
             }
             setActiveCreationType(null);
@@ -853,7 +875,7 @@ export const PersonaHubScreen: React.FC<PersonaHubScreenProps> = React.memo(({
       ) : (
         <>
         {/* Top Fixed Area for Header, Search and Tabs */}
-      <div className={`px-5 pt-3.5 pb-1.5 flex-shrink-0 ${isLight ? 'bg-white' : 'bg-[#121214]'}`}>
+      <div className={`px-5 pt-[calc(env(safe-area-inset-top,0px)+0.875rem)] pb-1.5 flex-shrink-0 transition-colors ${isLight ? 'bg-white' : 'bg-[#121214]'}`}>
         {/* Top Header - Authentic branding & Standalone Create Button */}
         <div className="flex items-center justify-between mb-4 mt-1">
           <div className="flex items-center gap-2">
@@ -1235,8 +1257,7 @@ export const PersonaHubScreen: React.FC<PersonaHubScreenProps> = React.memo(({
                                 // If there is an existing chat history, resume it; otherwise start fresh
                                 const matchingHistories = (storageConfig?.chatHistories || []).filter(h => h.personaId === persona.id);
                                 if (matchingHistories.length > 0) {
-                                  const getSessionTime = (h: any) => h.updatedAt || parseInt(h.id?.split('-')[1]) || 0;
-                                  const sorted = [...matchingHistories].sort((a, b) => getSessionTime(b) - getSessionTime(a));
+                                  const sorted = [...matchingHistories].sort((a, b) => getLastMessageTime(b) - getLastMessageTime(a));
                                   if (sorted[0] && onResumeChat) {
                                     onResumeChat(sorted[0].id);
                                     return;

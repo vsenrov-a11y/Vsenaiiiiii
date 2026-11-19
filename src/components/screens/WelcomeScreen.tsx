@@ -14,7 +14,7 @@ export const WelcomeScreen: React.FC<WelcomeScreenProps> = ({
   const isLight = theme === 'light';
 
   return (
-    <div className={`flex-1 flex flex-col items-center justify-between p-8 text-center select-none overflow-hidden transition-colors duration-200 ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#121214]'}`}>
+    <div className={`flex-1 flex flex-col items-center justify-between px-8 pt-[calc(env(safe-area-inset-top,0px)+2rem)] pb-[calc(env(safe-area-inset-bottom,0px)+2rem)] text-center select-none overflow-hidden transition-colors duration-200 ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#121214]'}`}>
       
       {/* Centered branding details */}
       <div className="w-full flex-1 flex flex-col items-center justify-center">

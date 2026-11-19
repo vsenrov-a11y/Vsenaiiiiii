@@ -1,7 +1,7 @@
 export function shouldSkipSceneDetection(userMessage: string, characterMessage: string): boolean {
   const combined = (userMessage + " " + characterMessage).toLowerCase();
   
-  // A heuristic list of keywords that imply state changes:
+  // A heuristic list of keywords that imply state changes or important memory moments:
   const triggerKeywords = [
     'walk', 'run', 'go', 'head to', 'arrive', 'leave', 'enter', 'exit', 'travel', // location
     'sleep', 'wake', 'bed', 'morning', 'night', 'tomorrow', 'later', 'tired', 'yawn', // calendar / energy
@@ -10,7 +10,8 @@ export function shouldSkipSceneDetection(userMessage: string, characterMessage: 
     'shower', 'bath', 'wash', 'clean', 'dirty', 'sweat', // hygiene
     'kiss', 'touch', 'hug', 'love', 'hate', 'angry', 'mad', 'smile', 'blush', 'moan', // relationships / arousal
     'buy', 'sell', 'pay', 'cost', 'money', // inventory
-    'hurt', 'pain', 'bleed', 'doctor', 'hospital' // health
+    'hurt', 'pain', 'bleed', 'doctor', 'hospital', // health
+    'name', 'who are', 'introduce', 'i am', 'my name', 'call me', 'promise', 'remember', 'secret', 'quest', 'deal', 'happen', 'killed', 'found', 'sword', 'magic' // memories & key milestones
   ];
 
   // If none of the trigger keywords are present, we skip the API call.
@@ -27,14 +28,11 @@ export async function detectSceneState(params: {
   worldCalendarInput: string,
   worldLocationInput: string,
   worldWeatherInput: string,
-  worldReputationInput: string,
-  charRelScores: any,
-  getInitialCharScores: any,
-  worldChars: any[],
+  worldChars?: any[],
   apiKey?: string,
   storageConfig: any,
   characterState: any,
-  defaultTargetCharId: string,
+  defaultTargetCharId?: string,
   signal: AbortSignal
 }) {
   const fallback = {
@@ -45,8 +43,7 @@ export async function detectSceneState(params: {
     calendar: "no_change",
     location: "no_change",
     weather: "no_change",
-    reputation: "no_change",
-    relationships: null,
+    keyMemory: null,
     characterState: null
   };
 
@@ -66,8 +63,6 @@ export async function detectSceneState(params: {
         currentCalendar: params.worldCalendarInput,
         currentLocation: params.worldLocationInput,
         currentWeather: params.worldWeatherInput,
-        currentReputation: params.worldReputationInput,
-        currentRelationships: params.charRelScores[params.defaultTargetCharId] || params.getInitialCharScores(params.defaultTargetCharId, params.defaultTargetCharName),
         characters: params.worldChars,
         customApiKey: params.apiKey,
         customApiKeys: params.storageConfig?.apiKeys,

@@ -2,7 +2,8 @@ import React, { useState, useRef, useEffect } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { StorageConfig, World, Place, AmbientSound } from '../../types';
 import { PERSONAS } from '../../data/personas';
-import { storeAsset, getAsset, useAsset } from '../../utils/fileDb';
+import { storeAsset, getAsset, getAssetSync, useAsset } from '../../utils/fileDb';
+import { getPlayableAudioUrl, createOptimizedAudioElement } from '../../utils/audioHelper';
 import { SafeImage } from '../common/SafeImage';
 import { ImageCropModal } from '../ImageCropModal';
 import { 
@@ -22,7 +23,8 @@ import {
   Plus,
   Play,
   Square,
-  FileAudio
+  FileAudio,
+  Video
 } from 'lucide-react';
 
 interface WorldCreatorProps {
@@ -30,10 +32,11 @@ interface WorldCreatorProps {
   storageConfig: StorageConfig;
   onClose: () => void;
   onSave: (world: World) => void;
+  onUpdate?: (world: World) => void;
   initialData?: World | null;
 }
 
-export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialData }: WorldCreatorProps) {
+export function WorldCreator({ isLight, storageConfig, onClose, onSave, onUpdate, initialData }: WorldCreatorProps) {
   const isEdit = !!initialData;
   const [step, setStep] = useState(1);
 
@@ -114,6 +117,7 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
 
   // Audio Playback Preview State
   const [playingAudioId, setPlayingAudioId] = useState<string | null>(null);
+  const [creatorNotice, setCreatorNotice] = useState<string | null>(null);
   const audioPreviewRef = useRef<HTMLAudioElement | null>(null);
 
   // Cleanup audio preview on unmount
@@ -187,6 +191,39 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
     };
 
     onSave(newWorld);
+  };
+
+  const autoPersistWorld = (overrides?: Partial<World>) => {
+    if (!initialData) return;
+    const finalPlaces = (overrides?.places || places).length > 0 
+      ? (overrides?.places || places) 
+      : [{ name: 'General', image: '' }];
+    const finalSounds = (overrides?.ambientSounds || ambientSounds).length > 0 
+      ? (overrides?.ambientSounds || ambientSounds) 
+      : [{ name: 'General', audioFile: '' }];
+
+    const updatedWorld: World = {
+      ...initialData,
+      name: name.trim() || initialData.name,
+      tagline: tagline.trim(),
+      description: description.trim(),
+      worldDefinition: definition.trim(),
+      exampleDialogue: exampleDialogue.trim(),
+      greeting: greeting.trim(),
+      coverImage: avatar,
+      visibility: privacy === 'public' ? 'Public' : (privacy === 'unlisted' ? 'Unlisted' : 'Private'),
+      places: finalPlaces,
+      ambientSounds: finalSounds,
+      linkedCharacterIds: overrides?.linkedCharacterIds || linkedCharacterIds,
+      updatedAt: Date.now(),
+      ...overrides
+    };
+
+    if (onUpdate) {
+      onUpdate(updatedWorld);
+    } else {
+      onSave(updatedWorld);
+    }
   };
 
   const compressAndGetBase64 = (file: File, maxWidth = 800, maxHeight = 800): Promise<string> => {
@@ -318,41 +355,43 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
     const file = e.target.files?.[0];
     if (!file) return;
     const inputElement = e.target;
-    const fileName = file.name || 'Audio Track';
+    const fileName = file.name || 'Background Video';
 
     try {
-      const assetId = `sound-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-      // Direct Blob/File storage in IndexedDB (bypasses atob & base64 bloat, handles large MP3s natively)
+      const assetId = `video-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+      // Direct Blob/File storage in IndexedDB
       const dbRef = await storeAsset(assetId, file);
       
       if (isGeneral) {
         setAmbientSounds(prev => {
           const updated = [...prev];
           if (updated.length === 0) {
-            updated.push({ id: 'sound-general', name: 'General', audioFile: dbRef });
+            updated.push({ id: 'sound-general', name: 'General', videoFile: dbRef, audioFile: dbRef });
           } else {
-            updated[0] = { ...updated[0], audioFile: dbRef };
+            updated[0] = { ...updated[0], id: 'sound-general', name: 'General', videoFile: dbRef, audioFile: dbRef };
           }
+          if (isEdit) autoPersistWorld({ ambientSounds: updated });
           return updated;
         });
       } else {
+        const cleanName = soundNameInput.trim() || fileName.replace(/\.[^/.]+$/, "");
         setSoundAudioInput(dbRef);
         setSoundAudioName(fileName);
         if (!soundNameInput.trim()) {
-          setSoundNameInput(fileName.replace(/\.[^/.]+$/, ""));
+          setSoundNameInput(cleanName);
         }
       }
     } catch (err) {
-      console.error("Audio direct upload failed, trying data URL fallback", err);
+      console.error("Video direct upload failed, trying data URL fallback", err);
       try {
         const reader = new FileReader();
         reader.onload = async (event) => {
           if (event.target?.result) {
-            const audioData = event.target.result as string;
-            const assetId = `sound-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
-            let fallbackRef = audioData;
+            const videoData = event.target.result as string;
+            const assetId = `video-${Date.now()}-${Math.random().toString(36).substring(2, 9)}`;
+            let fallbackRef = videoData;
             try {
-              fallbackRef = await storeAsset(assetId, audioData);
+              fallbackRef = await storeAsset(assetId, videoData);
             } catch (sErr) {
               console.warn("storeAsset fallback error", sErr);
             }
@@ -361,24 +400,26 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
               setAmbientSounds(prev => {
                 const updated = [...prev];
                 if (updated.length === 0) {
-                  updated.push({ id: 'sound-general', name: 'General', audioFile: fallbackRef });
+                  updated.push({ id: 'sound-general', name: 'General', videoFile: fallbackRef, audioFile: fallbackRef });
                 } else {
-                  updated[0] = { ...updated[0], audioFile: fallbackRef };
+                  updated[0] = { ...updated[0], id: 'sound-general', name: 'General', videoFile: fallbackRef, audioFile: fallbackRef };
                 }
+                if (isEdit) autoPersistWorld({ ambientSounds: updated });
                 return updated;
               });
             } else {
+              const cleanName = soundNameInput.trim() || fileName.replace(/\.[^/.]+$/, "");
               setSoundAudioInput(fallbackRef);
               setSoundAudioName(fileName);
               if (!soundNameInput.trim()) {
-                setSoundNameInput(fileName.replace(/\.[^/.]+$/, ""));
+                setSoundNameInput(cleanName);
               }
             }
           }
         };
         reader.readAsDataURL(file);
       } catch (fErr) {
-        console.error("FileReader audio fallback failed", fErr);
+        console.error("FileReader video fallback failed", fErr);
       }
     } finally {
       inputElement.value = "";
@@ -391,10 +432,13 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
     } else {
       stopAudioPreview();
       try {
-        const resolvedData = await getAsset(audioData);
-        if (!resolvedData || resolvedData.startsWith('db:')) return;
+        const rawResolved = await getAsset(audioData);
+        if (!rawResolved || rawResolved.startsWith('db:')) return;
+        const resolvedData = getPlayableAudioUrl(rawResolved);
+        if (!resolvedData) return;
 
-        const audio = new Audio(resolvedData);
+        const audio = createOptimizedAudioElement();
+        audio.src = resolvedData;
         audioPreviewRef.current = audio;
         setPlayingAudioId(id);
 
@@ -404,12 +448,14 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
         audio.onerror = (e) => {
           console.error("Audio playback error", e);
           setPlayingAudioId(null);
+          setCreatorNotice("Audio track could not be played. Check audio file format or browser permissions.");
         };
         
         await audio.play();
       } catch (err) {
         console.error("Failed to play audio preview", err);
         setPlayingAudioId(null);
+        setCreatorNotice("Audio preview playback failed. Audio will still be saved with your world.");
       }
     }
   };
@@ -427,7 +473,11 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
           image: placeImageInput, 
           triggerDescription: pTrigger 
         };
-        setPlaces(prev => [...prev, newPlace]);
+        setPlaces(prev => {
+          const next = [...prev, newPlace];
+          if (isEdit) autoPersistWorld({ places: next });
+          return next;
+        });
       } else if (placeFormMode === 'edit' && editingPlaceIndex !== null && editingPlaceIndex >= 0) {
         setPlaces(prev => {
           const updated = [...prev];
@@ -440,6 +490,7 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
               triggerDescription: pTrigger
             };
           }
+          if (isEdit) autoPersistWorld({ places: updated });
           return updated;
         });
       }
@@ -461,10 +512,15 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
         const newSound: AmbientSound = { 
           id: `sound-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
           name: sName || defaultName, 
+          videoFile: soundAudioInput,
           audioFile: soundAudioInput, 
           triggerDescription: sTrigger 
         };
-        setAmbientSounds(prev => [...prev, newSound]);
+        setAmbientSounds(prev => {
+          const next = [...prev, newSound];
+          if (isEdit) autoPersistWorld({ ambientSounds: next });
+          return next;
+        });
       } else if (soundFormMode === 'edit' && editingSoundIndex !== null && editingSoundIndex >= 0) {
         setAmbientSounds(prev => {
           const updated = [...prev];
@@ -473,10 +529,12 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
               ...updated[editingSoundIndex],
               id: updated[editingSoundIndex].id || `sound-${Date.now()}-${editingSoundIndex}`,
               name: sName || updated[editingSoundIndex].name,
+              videoFile: soundAudioInput || updated[editingSoundIndex].videoFile || updated[editingSoundIndex].audioFile,
               audioFile: soundAudioInput || updated[editingSoundIndex].audioFile,
               triggerDescription: sTrigger
             };
           }
+          if (isEdit) autoPersistWorld({ ambientSounds: updated });
           return updated;
         });
       }
@@ -895,7 +953,11 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
                               <button
                                 type="button"
                                 onClick={() => {
-                                  setPlaces(prev => prev.filter((_, i) => i !== index));
+                                  setPlaces(prev => {
+                                    const next = prev.filter((_, i) => i !== index);
+                                    if (isEdit) autoPersistWorld({ places: next });
+                                    return next;
+                                  });
                                 }}
                                 className="p-2 rounded-lg hover:bg-rose-500/10 text-rose-500/70 hover:text-rose-500 transition-colors"
                               >
@@ -934,7 +996,10 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
             <div className={`p-4 ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#0f0f10]'}`}>
               <button 
                 type="button"
-                onClick={() => setSubPage('none')}
+                onClick={() => {
+                  if (isEdit) autoPersistWorld({ places });
+                  setSubPage('none');
+                }}
                 className={`w-full py-4 rounded-[28px] font-bold text-[16px] transition-all cursor-pointer ${isLight ? 'bg-black text-white hover:bg-black/90' : 'bg-white text-black hover:bg-white/90'}`}
               >
                 Save places roster
@@ -966,6 +1031,7 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
                 if (isEditingForm) {
                   resetSoundForm();
                 } else {
+                  if (isEdit) autoPersistWorld({ ambientSounds });
                   setSubPage('none');
                 }
               }} 
@@ -974,7 +1040,7 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
               <ArrowLeft className="w-5 h-5" />
             </button>
             <h2 className="text-[17px] font-semibold">
-              {isEditingForm ? (soundFormMode === 'add' ? 'Add Ambient Sound' : 'Edit Ambient Sound') : 'Ambient Sounds'}
+              {isEditingForm ? (soundFormMode === 'add' ? 'Add Ambient Video' : 'Edit Ambient Video') : 'Ambient Videos'}
             </h2>
             {isEditingForm ? (
               <button
@@ -991,17 +1057,17 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
 
           <div className="flex-1 overflow-y-auto px-5 py-6">
             {isEditingForm ? (
-              /* Add / Edit Custom Sound Form */
+              /* Add / Edit Custom Video Form */
               <div className="space-y-5">
                 <div>
                   <label className={`block text-[11px] font-extrabold uppercase tracking-wider mb-2 ${isLight ? 'text-black/40' : 'text-white/30'}`}>
-                    Sound Name
+                    Video Scene Name
                   </label>
                   <input 
                     type="text"
                     value={soundNameInput || ''}
                     onChange={(e) => setSoundNameInput(e.target.value)}
-                    placeholder="e.g. Dynamic Battle Theme, Cozy Tavern Lute"
+                    placeholder="e.g. Rainy Neon Alley, Cosmic Nebula, Cozy Fireplace"
                     className={`w-full py-4 px-6 rounded-[28px] text-[14px] font-semibold focus:outline-none focus:ring-1 ${
                       isLight ? 'bg-black/5 text-black placeholder-black/30 border border-black/5' : 'bg-[#1C1C1E]/80 backdrop-blur-md text-white placeholder-white/30 border border-white/5'
                     }`}
@@ -1016,23 +1082,23 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
                     type="text"
                     value={soundTriggerInput || ''}
                     onChange={(e) => setSoundTriggerInput(e.target.value)}
-                    placeholder="Play this track when scenes turn tense or action occurs"
+                    placeholder="Play this background video when scenes turn tense or night falls"
                     className={`w-full py-4 px-6 rounded-[28px] text-[14px] focus:outline-none focus:ring-1 ${
                       isLight ? 'bg-black/5 text-black placeholder-black/30 border border-black/5' : 'bg-[#1C1C1E]/80 backdrop-blur-md text-white placeholder-white/30 border border-white/5'
                     }`}
                   />
                   <p className={`text-[11px] mt-1 px-1 ${isLight ? 'text-black/40' : 'text-white/40'}`}>
-                    Helps the AI system select this music track when roleplay mood shifts.
+                    Helps the AI system select this video backdrop when roleplay setting shifts.
                   </p>
                 </div>
 
                 <div>
                   <label className={`block text-[11px] font-extrabold uppercase tracking-wider mb-2 ${isLight ? 'text-black/40' : 'text-white/30'}`}>
-                    Upload Audio Track
+                    Upload Background Video (.mp4, .webm, .mov)
                   </label>
                   <input 
                     type="file" 
-                    accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac,audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/ogg,audio/aac,audio/x-m4a" 
+                    accept="video/*,.mp4,.webm,.mov,video/mp4,video/webm,video/quicktime" 
                     ref={soundFileInputRef} 
                     onChange={(e) => handleSoundAudioUpload(e, false)} 
                     className="hidden" 
@@ -1040,22 +1106,30 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
                   
                   <div 
                     onClick={() => soundFileInputRef.current?.click()}
-                    className={`w-full p-6 rounded-2xl overflow-hidden flex flex-col items-center justify-center cursor-pointer hover:opacity-90 transition-opacity border ${
+                    className={`relative w-full h-44 rounded-2xl overflow-hidden flex flex-col items-center justify-center cursor-pointer hover:opacity-90 transition-opacity border ${
                       isLight ? 'bg-black/5 border-black/10' : 'bg-[#1C1C1E]/80 backdrop-blur-md border-white/5'
                     }`}
                   >
                     {soundAudioInput ? (
-                      <div className="flex flex-col items-center">
-                        <FileAudio className="w-10 h-10 mb-2 text-zinc-400" />
-                        <span className={`text-xs font-bold text-center break-all max-w-[240px] ${isLight ? 'text-black' : 'text-white'}`}>
-                          {soundAudioName || 'Audio Track Selected'}
-                        </span>
-                        <span className={`text-[10px] font-mono mt-1 ${isLight ? 'text-zinc-600' : 'text-zinc-400'}`}>Upload Completed</span>
+                      <div className="relative w-full h-full flex items-center justify-center">
+                        <video
+                          src={soundAudioInput.startsWith('db:') ? getAssetSync(soundAudioInput) || soundAudioInput : soundAudioInput}
+                          autoPlay
+                          loop
+                          muted
+                          playsInline
+                          {...({ 'webkit-playsinline': 'true' } as any)}
+                          className="absolute inset-0 w-full h-full object-cover z-0 pointer-events-none"
+                        />
+                        <div className="relative z-10 bg-black/60 backdrop-blur-sm px-4 py-2 rounded-full text-white text-xs font-bold flex items-center gap-2">
+                          <Video className="w-4 h-4 text-emerald-400" />
+                          <span>Video Selected (Tap to Change)</span>
+                        </div>
                       </div>
                     ) : (
                       <>
-                        <Music className={`w-8 h-8 mb-2 ${isLight ? 'text-black/20' : 'text-white/20'}`} />
-                        <span className={`text-xs ${isLight ? 'text-black/40' : 'text-white/40'}`}>Select background audio file (.mp3, .wav)</span>
+                        <Video className={`w-8 h-8 mb-2 ${isLight ? 'text-black/20' : 'text-white/20'}`} />
+                        <span className={`text-xs ${isLight ? 'text-black/40' : 'text-white/40'}`}>Select background video (.mp4, .webm, .mov)</span>
                       </>
                     )}
                   </div>
@@ -1079,20 +1153,20 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
                 </div>
               </div>
             ) : (
-              /* Main Ambient Sounds List */
+              /* Main Ambient Video List */
               <div className="space-y-6">
-                {/* Mandatory General Sound */}
+                {/* Default General Video */}
                 <div>
                   <div className="flex items-center justify-between mb-2">
                     <h3 className={`text-xs uppercase tracking-wider font-extrabold ${isLight ? 'text-black/50' : 'text-white/40'}`}>
                       Default Setting
                     </h3>
-                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-md ${isLight ? 'text-zinc-700 bg-zinc-100' : 'text-zinc-300 bg-white/[0.04]'}`}>General / Fallback Track</span>
+                    <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded-md ${isLight ? 'text-zinc-700 bg-zinc-100' : 'text-zinc-300 bg-white/[0.04]'}`}>General / Fallback Video</span>
                   </div>
 
                   <input 
                     type="file" 
-                    accept="audio/*,.mp3,.wav,.ogg,.m4a,.aac,.flac,audio/mpeg,audio/mp3,audio/wav,audio/x-wav,audio/ogg,audio/aac,audio/x-m4a" 
+                    accept="video/*,.mp4,.webm,.mov,video/mp4,video/webm,video/quicktime" 
                     ref={generalSoundFileInputRef} 
                     onChange={(e) => handleSoundAudioUpload(e, true)} 
                     className="hidden" 
@@ -1100,114 +1174,96 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
 
                   <div 
                     onClick={() => generalSoundFileInputRef.current?.click()}
-                    className={`relative w-full p-6 rounded-2xl border cursor-pointer hover:opacity-95 transition-opacity flex flex-col items-center justify-center ${
+                    className={`relative w-full h-44 rounded-2xl border cursor-pointer hover:opacity-95 transition-opacity flex flex-col items-center justify-center overflow-hidden ${
                       isLight ? 'bg-black/[0.02] border-black/[0.08]' : 'bg-[#1C1C1E]/80 backdrop-blur-md border-white/5'
                     }`}
                   >
-                    {ambientSounds[0]?.audioFile ? (
-                      <div className="flex flex-col items-center text-center">
-                        <FileAudio className="w-10 h-10 mb-2 text-zinc-400" />
-                        <span className={`text-xs font-bold text-center ${isLight ? 'text-black/70' : 'text-white/70'}`}>
-                          General Background Music Loaded
-                        </span>
-                        <div className="flex items-center gap-2 mt-3" onClick={(e) => e.stopPropagation()}>
-                          <button
-                            type="button"
-                            onClick={() => togglePlayAudio(ambientSounds[0]?.audioFile || '', 'general')}
-                            className={`px-4 py-1.5 rounded-full text-[10px] font-bold flex items-center gap-1.5 transition-colors ${
-                              playingAudioId === 'general' ? 'bg-zinc-800 text-white dark:bg-white dark:text-black' : (isLight ? 'bg-black/10 text-black hover:bg-black/20' : 'bg-white/10 text-white hover:bg-white/15')
-                            }`}
-                          >
-                            {playingAudioId === 'general' ? (
-                              <>
-                                <Square className={`w-3 h-3 ${isLight ? 'fill-white' : 'fill-black'}`} />
-                                Pause Preview
-                              </>
-                            ) : (
-                              <>
-                                <Play className="w-3 h-3 fill-current" />
-                                Preview Track
-                              </>
-                            )}
-                          </button>
-                          <button 
-                            type="button"
-                            onClick={() => generalSoundFileInputRef.current?.click()}
-                            className={`px-3 py-1.5 rounded-full text-[10px] font-bold ${isLight ? 'bg-black/5 hover:bg-black/10' : 'bg-white/5 hover:bg-white/10'}`}
-                          >
-                            Change File
-                          </button>
+                    {(ambientSounds[0]?.videoFile || ambientSounds[0]?.audioFile) ? (
+                      <div className="relative w-full h-full flex items-center justify-center">
+                        <video
+                          src={getAssetSync(ambientSounds[0]?.videoFile || ambientSounds[0]?.audioFile) || (ambientSounds[0]?.videoFile || ambientSounds[0]?.audioFile)}
+                          autoPlay
+                          loop
+                          muted
+                          playsInline
+                          {...({ 'webkit-playsinline': 'true' } as any)}
+                          className="absolute inset-0 w-full h-full object-cover z-0 pointer-events-none"
+                        />
+                        <div className="relative z-10 bg-black/60 backdrop-blur-sm px-4 py-2 rounded-full text-white text-xs font-bold flex items-center gap-2">
+                          <Video className="w-4 h-4 text-emerald-400" />
+                          <span>General Background Video Loaded</span>
                         </div>
                       </div>
                     ) : (
                       <>
-                        <Music className={`w-10 h-10 mb-2 ${isLight ? 'text-black/20' : 'text-white/20'}`} />
-                        <span className={`text-[12px] font-bold ${isLight ? 'text-black/60' : 'text-white/60'}`}>Upload General Sound Track</span>
+                        <Video className={`w-10 h-10 mb-2 ${isLight ? 'text-black/20' : 'text-white/20'}`} />
+                        <span className={`text-[12px] font-bold ${isLight ? 'text-black/60' : 'text-white/60'}`}>Upload General Background Video</span>
                         <span className={`text-[10px] text-center max-w-[220px] leading-relaxed mt-1 ${isLight ? 'text-black/40' : 'text-white/30'}`}>
-                          Plays when no specialized triggers are active.
+                          Plays seamlessly in loop when entering this world.
                         </span>
                       </>
                     )}
                   </div>
                 </div>
 
-                {/* Custom Ambient Sounds */}
+                {/* Custom Ambient Videos */}
                 <div>
                   <div className="flex items-center justify-between mb-3">
                     <h3 className={`text-xs uppercase tracking-wider font-extrabold ${isLight ? 'text-black/50' : 'text-white/40'}`}>
-                      Custom Dynamic Tracks ({customSounds.length} / 10)
+                      Custom Dynamic Videos ({customSounds.length} / 10)
                     </h3>
                   </div>
 
                   {customSounds.length === 0 ? (
                     <div className={`p-6 text-center border-2 border-dashed rounded-2xl ${isLight ? 'bg-black/[0.01] border-black/5' : 'bg-white/[0.01] border-white/[0.03]'}`}>
-                      <Music className={`w-6 h-6 mx-auto mb-2 ${isLight ? 'text-black/20' : 'text-white/20'}`} />
-                      <p className={`text-xs font-medium ${isLight ? 'text-black/40' : 'text-white/30'}`}>No dynamic tracks added yet.</p>
+                      <Video className={`w-6 h-6 mx-auto mb-2 ${isLight ? 'text-black/20' : 'text-white/20'}`} />
+                      <p className={`text-xs font-medium ${isLight ? 'text-black/40' : 'text-white/30'}`}>No dynamic video backgrounds added yet.</p>
                       <p className={`text-[10px] mt-0.5 leading-relaxed ${isLight ? 'text-black/35' : 'text-white/25'}`}>
-                        Add battle, tension, or atmospheric soundtracks triggered by scenes.
+                        Add video backdrops for different scenes and atmospheres.
                       </p>
                     </div>
                   ) : (
                     <div className="space-y-3">
                       {ambientSounds.map((sound, index) => {
                         if (index === 0) return null; // skip default general
+                        const vFile = sound.videoFile || sound.audioFile;
                         return (
                           <div 
                             key={sound.id || `sound-${index}-${sound.name}`}
-                            className={`p-3 rounded-2xl border flex items-center gap-3 relative ${
+                            className={`p-3 rounded-2xl border flex items-center gap-3 relative overflow-hidden ${
                               isLight ? 'bg-white border-black/5' : 'bg-[#1C1C1E]/80 backdrop-blur-md border-white/5'
                             }`}
                           >
-                            <button
-                              type="button"
-                              onClick={() => togglePlayAudio(sound.audioFile, `sound-${index}`)}
-                              className={`w-10 h-10 rounded-xl flex items-center justify-center flex-shrink-0 transition-colors ${
-                                playingAudioId === `sound-${index}` ? 'bg-zinc-800 text-white dark:bg-white dark:text-black animate-pulse' : (isLight ? 'bg-black/5 hover:bg-black/10' : 'bg-white/10 hover:bg-white/15')
-                              }`}
-                            >
-                              {playingAudioId === `sound-${index}` ? (
-                                <Square className={`w-4 h-4 ${isLight ? 'fill-white' : 'fill-black'}`} />
-                              ) : (
-                                <Play className="w-4 h-4 fill-current ml-0.5" />
+                            <div className="w-16 h-12 rounded-xl overflow-hidden bg-black relative flex-shrink-0">
+                              {vFile && (
+                                <video
+                                  src={getAssetSync(vFile) || vFile}
+                                  autoPlay
+                                  loop
+                                  muted
+                                  playsInline
+                                  {...({ 'webkit-playsinline': 'true' } as any)}
+                                  className="absolute inset-0 w-full h-full object-cover z-0 pointer-events-none"
+                                />
                               )}
-                            </button>
+                            </div>
                             
-                            <div className="flex-1 min-w-0">
+                            <div className="flex-1 min-w-0 z-10">
                               <h4 className={`text-xs font-extrabold ${isLight ? 'text-black' : 'text-white'}`}>{sound.name}</h4>
                               <p className={`text-[11px] truncate leading-normal italic ${isLight ? 'text-black/50' : 'text-white/40'}`}>
                                 "{sound.triggerDescription || 'No trigger specified'}"
                               </p>
                             </div>
 
-                            <div className="flex items-center gap-1">
+                            <div className="flex items-center gap-1 z-10">
                               <button
                                 type="button"
                                 onClick={() => {
                                   setSoundFormMode('edit');
                                   setEditingSoundIndex(index);
                                   setSoundNameInput(sound.name || '');
-                                  setSoundAudioInput(sound.audioFile || '');
-                                  setSoundAudioName('Audio Track Ready');
+                                  setSoundAudioInput(vFile || '');
+                                  setSoundAudioName('Video File Loaded');
                                   setSoundTriggerInput(sound.triggerDescription || '');
                                 }}
                                 className={`p-2 rounded-lg transition-colors ${isLight ? 'hover:bg-black/5 text-black/50 hover:text-black' : 'hover:bg-white/5 text-white/50 hover:text-white'}`}
@@ -1217,7 +1273,11 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
                               <button
                                 type="button"
                                 onClick={() => {
-                                  setAmbientSounds(prev => prev.filter((_, i) => i !== index));
+                                  setAmbientSounds(prev => {
+                                    const next = prev.filter((_, i) => i !== index);
+                                    if (isEdit) autoPersistWorld({ ambientSounds: next });
+                                    return next;
+                                  });
                                 }}
                                 className="p-2 rounded-lg hover:bg-rose-500/10 text-rose-500/70 hover:text-rose-500 transition-colors"
                               >
@@ -1245,7 +1305,7 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
                       className="w-full mt-4 p-4 border border-dashed rounded-2xl flex items-center justify-center gap-2 font-bold text-xs text-accent hover:bg-black/[0.01] dark:hover:bg-white/[0.01] cursor-pointer"
                     >
                       <Plus className="w-4 h-4" />
-                      <span>Add Ambient Sound</span>
+                      <span>Add Ambient Video</span>
                     </button>
                   )}
                 </div>
@@ -1257,10 +1317,13 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
             <div className={`p-4 ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#0f0f10]'}`}>
               <button 
                 type="button"
-                onClick={() => setSubPage('none')}
+                onClick={() => {
+                  if (isEdit) autoPersistWorld({ ambientSounds });
+                  setSubPage('none');
+                }}
                 className={`w-full py-4 rounded-[28px] font-bold text-[16px] transition-all cursor-pointer ${isLight ? 'bg-black text-white hover:bg-black/90' : 'bg-white text-black hover:bg-white/90'}`}
               >
-                Save audio library
+                Save video library
               </button>
             </div>
           )}
@@ -1547,8 +1610,17 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
         </AnimatePresence>
 
         {/* Header */}
-        <div className={`px-4 py-3 flex items-center justify-between relative border-b ${isLight ? 'text-black border-black/5 bg-[#F8F9FA]' : 'text-white border-white/5 bg-[#0f0f10]'}`}>
-          <button type="button" onClick={onClose} className={`p-2 -ml-2 rounded-full transition-colors ${isLight ? 'bg-black/5 hover:bg-black/10' : 'bg-white/5 hover:bg-white/10'}`}>
+        <div className={`px-4 pb-3 pt-[calc(env(safe-area-inset-top,0px)+0.75rem)] flex items-center justify-between relative border-b transition-colors ${isLight ? 'text-black border-black/5 bg-[#F8F9FA]' : 'text-white border-white/5 bg-[#0f0f10]'}`}>
+          <button 
+            type="button" 
+            onClick={() => {
+              if (isEdit) {
+                autoPersistWorld();
+              }
+              onClose();
+            }} 
+            className={`p-2 -ml-2 rounded-full transition-colors ${isLight ? 'bg-black/5 hover:bg-black/10' : 'bg-white/5 hover:bg-white/10'}`}
+          >
             <ArrowLeft className="w-5 h-5" />
           </button>
           <h2 className="text-[17px] font-semibold text-center flex-1 pr-4">Edit World</h2>
@@ -1565,6 +1637,13 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
             Save
           </button>
         </div>
+
+        {creatorNotice && (
+          <div className="bg-amber-500/15 border-b border-amber-500/30 px-4 py-2 flex items-center justify-between text-xs text-amber-200">
+            <span>{creatorNotice}</span>
+            <button type="button" onClick={() => setCreatorNotice(null)} className="ml-2 font-bold underline">Dismiss</button>
+          </div>
+        )}
 
         {/* Scrollable Content */}
         <div className="flex-1 overflow-y-auto px-5 pt-6 pb-24">
@@ -1832,7 +1911,7 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
       </AnimatePresence>
 
       {/* Header */}
-      <div className={`px-4 py-3 flex items-center justify-center relative ${isLight ? 'text-black' : 'text-white'}`}>
+      <div className={`px-4 pb-3 pt-[calc(env(safe-area-inset-top,0px)+0.75rem)] flex items-center justify-center relative transition-colors ${isLight ? 'text-black' : 'text-white'}`}>
         {step === 1 ? (
           <button type="button" onClick={onClose} className={`absolute left-4 p-2 -ml-2 rounded-full transition-colors ${isLight ? 'bg-black/5 hover:bg-black/10' : 'bg-white/5 hover:bg-white/10'}`}>
             <X className="w-5 h-5" />
@@ -1844,6 +1923,13 @@ export function WorldCreator({ isLight, storageConfig, onClose, onSave, initialD
         )}
         <h2 className="text-[16px] font-semibold">Create World</h2>
       </div>
+
+      {creatorNotice && (
+        <div className="bg-amber-500/15 border-b border-amber-500/30 px-4 py-2 flex items-center justify-between text-xs text-amber-200">
+          <span>{creatorNotice}</span>
+          <button type="button" onClick={() => setCreatorNotice(null)} className="ml-2 font-bold underline">Dismiss</button>
+        </div>
+      )}
 
       {/* Body */}
       <div className="flex-1 overflow-y-auto px-5 pt-8 pb-32">

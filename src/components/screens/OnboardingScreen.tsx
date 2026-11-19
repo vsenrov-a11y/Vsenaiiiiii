@@ -28,7 +28,7 @@ export const OnboardingScreen: React.FC<OnboardingScreenProps> = ({
   };
 
   return (
-    <div className={`flex-1 flex flex-col justify-between p-4 overflow-y-auto select-none animate-fadeIn transition-colors duration-200 ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#121214]'}`}>
+    <div className={`flex-1 flex flex-col justify-between px-4 pt-[calc(env(safe-area-inset-top,0px)+1rem)] pb-[calc(env(safe-area-inset-bottom,0px)+1rem)] overflow-y-auto select-none animate-fadeIn transition-colors duration-200 ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#121214]'}`}>
       <div className="mt-2 font-sans space-y-6">
         <div>
           <div className="flex items-center gap-2 mb-1.5">

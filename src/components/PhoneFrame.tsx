@@ -39,10 +39,10 @@ export const PhoneFrame: React.FC<PhoneFrameProps> = ({
         <div className="flex items-center gap-2 bg-[#121212] p-1.5 rounded-2xl border border-white/10 font-sans">
           <button
             onClick={onOpenCodeViewer}
-            className="flex items-center gap-2 px-3 py-2 rounded-xl bg-[#1E1E1E] hover:bg-[#2A2A2A] text-xs font-bold text-white transition-all border border-white/5 shadow-sm active:scale-95 font-sans tracking-wide"
+            className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-[#8B5CF6]/20 hover:bg-[#8B5CF6]/30 text-xs font-bold text-purple-200 transition-all border border-purple-500/30 shadow-sm active:scale-95 font-sans tracking-wide"
           >
-            <Code2 className="w-3.5 h-3.5 text-[#E0E0E0]" />
-            <span>View Kotlin Source Code</span>
+            <Code2 className="w-3.5 h-3.5 text-purple-300" />
+            <span>View Flutter & Firebase Code</span>
           </button>
         </div>
       </div>

@@ -6,14 +6,19 @@ import { UserPersonaCreator } from './UserPersonaCreator';
 import { ImageCropModal } from '../ImageCropModal';
 import { OrbBadge } from '../common/OrbBadge';
 import { OrbWalletModal } from '../common/OrbWalletModal';
+import { AdminAudioModal } from '../common/AdminAudioModal';
 import { storeAsset, useAsset } from '../../utils/fileDb';
 import { SafeImage } from '../common/SafeImage';
 import { 
   subscribeToSyncState, 
   loginWithGoogle, 
   logoutAndReset, 
+  handleSignOut as handleCloudSignOut,
   pushConfigToCloud, 
   pullCloudData,
+  deleteCharacterFromDatabase,
+  deleteWorldFromDatabase,
+  saveUserPersonaToChat,
   CloudSyncState 
 } from '../../utils/cloudSync';
 
@@ -63,7 +68,9 @@ import {
   Cloud,
   RefreshCw,
   LogIn,
-  LogOut
+  LogOut,
+  ExternalLink,
+  Sliders
 } from 'lucide-react';
 
 const getPrimaryCategory = (persona: Persona) => {
@@ -262,9 +269,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
   const [isSafeFilterEnabled, setIsSafeFilterEnabled] = useState(storageConfig.isSafeFilterEnabled !== false);
   const [apiProvider, setApiProvider] = useState<'gemini' | 'openai'>(storageConfig.apiProvider ?? 'gemini');
   const [selectedModel, setSelectedModel] = useState<string>(
-    (storageConfig.selectedModel && storageConfig.selectedModel.startsWith('gemini-3.'))
-      ? storageConfig.selectedModel 
-      : 'gemini-3.8-flash'
+    storageConfig.selectedModel || 'gemini-3.8-flash'
   );
   const [theme, setTheme] = useState<'dark' | 'light'>(storageConfig.theme ?? 'dark');
   const isLight = theme === 'light';
@@ -277,6 +282,9 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
 
   // Orb Economy Modals State
   const [showOrbWallet, setShowOrbWallet] = useState(false);
+  const [showAdminAudio, setShowAdminAudio] = useState(false);
+  const [popupBlocked, setPopupBlocked] = useState(false);
+  const isIframe = typeof window !== 'undefined' && window.self !== window.top;
 
   // Key vault state
   const [apiKey, setApiKey] = useState(storageConfig.apiKey || '');
@@ -308,12 +316,19 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
   const handleGoogleLogin = async () => {
     try {
       setIsLoggingIn(true);
-      await loginWithGoogle(storageConfig, (newConfig) => {
+      setPopupBlocked(false);
+      const user = await loginWithGoogle(storageConfig, (newConfig) => {
         onUpdateConfig(newConfig);
       });
-      triggerToast("Google Account linked! Cloud sync active.");
+      if (user) {
+        triggerToast("Google Account linked! Cloud sync active.");
+      }
     } catch (err: any) {
-      triggerToast(err?.message || "Google sign-in failed");
+      const msg = err?.message || "Google sign-in failed";
+      if (msg.toLowerCase().includes("popup") || msg.toLowerCase().includes("blocked")) {
+        setPopupBlocked(true);
+      }
+      triggerToast(msg);
     } finally {
       setIsLoggingIn(false);
     }
@@ -321,10 +336,8 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
 
   const handleSignOut = async () => {
     try {
-      await logoutAndReset((newConfig) => {
-        onUpdateConfig(newConfig);
-      });
-      triggerToast("Signed out of Google Account.");
+      await handleCloudSignOut();
+      triggerToast("Successfully signed out.");
     } catch (err) {
       triggerToast("Sign out failed");
     }
@@ -601,6 +614,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
         username: editUsername.trim() || 'vsenrov',
         description: editDesc.trim(),
         avatar: editAvatar,
+        updatedAt: Date.now(),
       }
     });
     setShowEditProfile(false);
@@ -630,6 +644,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
       name: personaName.trim(),
       description: personaDesc.trim(),
       avatarGradient: randomGradient,
+      updatedAt: Date.now(),
     };
 
     const currentPersonas = storageConfig.userPersonas || [];
@@ -686,6 +701,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
     const { id, type } = deleteTarget;
 
     if (type === 'character') {
+      deleteCharacterFromDatabase(id).catch(() => {});
       const currentCustom = storageConfig.customPersonas || [];
       const currentChars = storageConfig.characters || [];
       const currentHistories = storageConfig.chatHistories || [];
@@ -696,6 +712,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
       });
       triggerToast("Character Deleted!");
     } else if (type === 'world') {
+      deleteWorldFromDatabase(id).catch(() => {});
       const currentWorlds = storageConfig.worlds || [];
       const currentHistories = storageConfig.chatHistories || [];
       const nextConfig: Partial<StorageConfig> = {
@@ -709,9 +726,14 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
       triggerToast("World Deleted!");
     } else if (type === 'persona') {
       const currentPersonas = storageConfig.userPersonas || [];
-      onUpdateConfig({
-        userPersonas: currentPersonas.filter(p => p.id !== id)
-      });
+      const nextPersonas = currentPersonas.filter(p => p.id !== id);
+      const nextConfig: Partial<StorageConfig> = {
+        userPersonas: nextPersonas
+      };
+      if (storageConfig.activeUserPersonaId === id) {
+        nextConfig.activeUserPersonaId = nextPersonas[0]?.id || '';
+      }
+      onUpdateConfig(nextConfig);
       triggerToast("Persona Deleted!");
     }
 
@@ -748,7 +770,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
       
       {/* Settings Panel Overlay Drawer */}
       {showSettings && (
-        <div className={`absolute inset-0 z-50 flex flex-col p-4 animate-fadeIn overflow-x-hidden max-w-full box-border ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#121214]'}`}>
+        <div className={`absolute inset-0 z-50 flex flex-col p-4 pt-[calc(env(safe-area-inset-top,0px)+1rem)] animate-fadeIn overflow-x-hidden max-w-full box-border transition-colors ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#121214]'}`}>
           {/* Header */}
           <div className="flex items-center justify-between mb-5 mt-1 px-1">
             <h3 className={`text-sm font-extrabold ${isLight ? 'text-[#1C1C1E]' : 'text-white'} uppercase tracking-wider font-sans truncate pr-2`}>Settings</h3>
@@ -853,7 +875,50 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
                           Sign in with Google to permanently link your characters, worlds, chats, and uploaded pictures across all devices with zero data loss.
                         </p>
                       </div>
+                      {isIframe && (
+                        <button
+                          onClick={() => window.open(window.location.href, '_blank')}
+                          className={`flex items-center gap-1 text-[10px] font-medium px-2 py-1 rounded-lg border transition-all cursor-pointer flex-shrink-0 ${
+                            isLight ? 'bg-black/5 border-black/10 text-black/70 hover:bg-black/10' : 'bg-white/5 border-white/10 text-white/70 hover:bg-white/10'
+                          }`}
+                          title="Open app in a new window to sign in without iframe restrictions"
+                        >
+                          <ExternalLink className="w-3 h-3" />
+                          <span>Popout</span>
+                        </button>
+                      )}
                     </div>
+
+                    {popupBlocked && (
+                      <div className={`p-3 rounded-xl border text-[11px] space-y-2 ${
+                        isLight ? 'bg-amber-50 border-amber-200 text-amber-900' : 'bg-amber-950/30 border-amber-500/30 text-amber-200'
+                      }`}>
+                        <div className="flex items-center gap-1.5 font-bold">
+                          <AlertTriangle className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" />
+                          <span>Google Sign-In Popup Blocked</span>
+                        </div>
+                        <p className="leading-relaxed">
+                          Your browser or iframe preview environment blocked the login popup. Click below to open in a new tab where Google Sign-In connects instantly:
+                        </p>
+                        <div className="flex items-center gap-2 pt-0.5">
+                          <button
+                            onClick={() => window.open(window.location.href, '_blank')}
+                            className="px-3 py-1.5 rounded-lg bg-amber-600 hover:bg-amber-700 text-white font-bold text-[10.5px] flex items-center gap-1.5 transition-all active:scale-95 cursor-pointer shadow-sm"
+                          >
+                            <ExternalLink className="w-3 h-3" />
+                            <span>Open App in New Tab</span>
+                          </button>
+                          <button
+                            onClick={handleGoogleLogin}
+                            className={`px-2.5 py-1.5 rounded-lg border font-medium text-[10.5px] transition-all cursor-pointer ${
+                              isLight ? 'bg-white border-amber-300 text-amber-900' : 'bg-black/40 border-amber-500/40 text-amber-200'
+                            }`}
+                          >
+                            Retry Here
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
                     <div className="flex items-center gap-2 pt-1">
                       <button
@@ -925,15 +990,15 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
                 </select>
               </div>
 
-              {/* Active Model Selector Row */}
+              {/* Model Selector Row */}
               <div className={`flex items-center justify-between gap-3 min-h-[64px] py-2 rounded-2xl px-4 border transition-all ${isLight ? 'bg-white border-black/[0.08] shadow-sm' : 'bg-white/[0.02] border-white/[0.04]'}`}>
                 <div className="flex items-center gap-3 min-w-0 flex-1">
                   <div className={`w-8 h-8 rounded-xl flex items-center justify-center flex-shrink-0 border ${isLight ? 'bg-zinc-800/10 border-zinc-800/15 text-zinc-800' : 'bg-white/[0.03] border-white/[0.08] text-white'}`}>
-                    <Sparkles className="w-4 h-4" />
+                    <Cpu className="w-4 h-4" />
                   </div>
                   <div className="min-w-0 flex-1">
                     <div className={`text-xs font-bold ${isLight ? 'text-[#1C1C1E]' : 'text-white'}`}>Active Model</div>
-                    <div className={`text-[10px] leading-relaxed font-sans block break-words ${isLight ? 'text-black/55' : 'text-white/40'}`}>Select AI model for chat & roleplay</div>
+                    <div className={`text-[10px] leading-relaxed font-sans block break-words ${isLight ? 'text-black/55' : 'text-white/40'}`}>Select Gemini AI model version</div>
                   </div>
                 </div>
                 <select
@@ -943,16 +1008,22 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
                     setSelectedModel(val);
                     onUpdateConfig({ selectedModel: val });
                   }}
-                  className={`border text-xs rounded-xl px-3 py-2 focus:outline-none focus:border-zinc-500 max-w-[200px] font-sans cursor-pointer ${isLight ? 'bg-white border-black/15 text-black' : 'bg-[#121214] border border-white/10 text-white'}`}
+                  className={`border text-xs rounded-xl px-3 py-2 focus:outline-none focus:border-zinc-500 max-w-[170px] font-sans cursor-pointer ${isLight ? 'bg-white border-black/15 text-black' : 'bg-[#121214] border border-white/10 text-white'}`}
                 >
-                  <optgroup label="Active Gemini Models">
-                    <option value="gemini-3.8-flash">Gemini 3.8 Flash (Recommended)</option>
-                    <option value="gemini-3.1-flash-lite">Gemini 3.1 Flash-Lite (Fast)</option>
-                    <option value="gemini-3.7-flash">Gemini 3.7 Flash</option>
-                    <option value="gemini-3.5-flash">Gemini 3.5 Flash</option>
-                    <option value="gemini-3.5-flash-lite">Gemini 3.5 Flash-Lite</option>
-                    <option value="gemini-3.1-pro-preview">Gemini 3.1 Pro (Reasoning)</option>
-                    <option value="gemini-flash-latest">Gemini Flash Latest</option>
+                  <optgroup label="Gemini Flash Family">
+                    <option value="gemini-3.8-flash">gemini-3.8-flash</option>
+                    <option value="gemini-3.6-flash">gemini-3.6-flash</option>
+                    <option value="gemini-3-flash-preview">gemini-3-flash-preview</option>
+                    <option value="gemini-2.5-flash">gemini-2.5-flash</option>
+                  </optgroup>
+                  <optgroup label="Flash-Lite Family">
+                    <option value="gemini-3.5-flash-lite">gemini-3.5-flash-lite</option>
+                    <option value="gemini-3.1-flash-lite">gemini-3.1-flash-lite</option>
+                    <option value="gemini-2.5-flash-lite">gemini-2.5-flash-lite</option>
+                  </optgroup>
+                  <optgroup label="Pro & Open">
+                    <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                    <option value="gemma-4">gemma-4</option>
                   </optgroup>
                 </select>
               </div>
@@ -1597,18 +1668,43 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
             <div className="space-y-2">
               <div className="text-[10px] font-bold text-white/45 uppercase tracking-widest px-1">Developer Controls</div>
               <div className="bg-[#1E1E1E]/40 backdrop-blur-lg rounded-2xl p-2 border border-white/[0.04] space-y-2">
-                {/* Kotlin Codebase */}
+                {/* Admin Menu & Audio Testing */}
+                <button
+                  type="button"
+                  onClick={() => setShowAdminAudio(true)}
+                  className="w-full p-4 rounded-2xl bg-purple-500/[0.08] hover:bg-purple-500/[0.14] border border-purple-500/30 text-white flex items-center justify-between gap-3 transition-all active:scale-[0.96] cursor-pointer text-left shadow-lg shadow-purple-950/20"
+                >
+                  <div className="flex items-center gap-3">
+                    <div className="w-8 h-8 rounded-xl bg-purple-500/20 border border-purple-500/40 flex items-center justify-center text-purple-300">
+                      <Sliders className="w-4 h-4 text-purple-300" />
+                    </div>
+                    <div>
+                      <div className="font-bold text-xs text-white flex items-center gap-2">
+                        <span>Admin Menu & Audio Testing</span>
+                        <span className="text-[9px] px-1.5 py-0.2 rounded-full bg-purple-500/30 text-purple-200 border border-purple-400/30 font-bold uppercase">
+                          Admin
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-white/50 font-sans">
+                        Web Audio test, synthesized ambient tracks & delayed event tests
+                      </div>
+                    </div>
+                  </div>
+                  <ChevronRight className="w-4 h-4 text-purple-300/70" />
+                </button>
+
+                {/* Codebase Viewer */}
                 <button
                   onClick={onOpenCodeViewer}
                   className="w-full p-4 rounded-2xl bg-white/[0.02] hover:bg-white/[0.06] border border-white/[0.04] text-white flex items-center justify-between gap-3 transition-all active:scale-[0.96] cursor-pointer text-left"
                 >
                   <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-xl bg-white/[0.03] border border-white/[0.08] flex items-center justify-center">
-                      <ShieldCheck className="w-4 h-4 text-[#E0E0E0]" />
+                    <div className="w-8 h-8 rounded-xl bg-[#8B5CF6]/10 border border-[#8B5CF6]/30 flex items-center justify-center">
+                      <ShieldCheck className="w-4 h-4 text-purple-300" />
                     </div>
                     <div>
-                      <div className="font-bold text-xs text-white">Kotlin Codebase</div>
-                      <div className="text-[10px] text-white/40 font-sans">Show classes and layout specifications</div>
+                      <div className="font-bold text-xs text-white">Flutter & Kotlin Source Architecture</div>
+                      <div className="text-[10px] text-white/40 font-sans">Firebase Firestore subcollections, offline cache & auth</div>
                     </div>
                   </div>
                   <ChevronRight className="w-4 h-4 text-white/30" />
@@ -1853,14 +1949,28 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
             }}
             onSave={(newPersona) => {
               const currentPersonas = storageConfig.userPersonas || [];
+              const personaWithTs = { ...newPersona, updatedAt: Date.now() };
               let updatedPersonas = [...currentPersonas];
               const existingIdx = updatedPersonas.findIndex(p => p.id === newPersona.id);
               if (existingIdx >= 0) {
-                updatedPersonas[existingIdx] = newPersona;
+                updatedPersonas[existingIdx] = personaWithTs;
               } else {
-                updatedPersonas.push(newPersona);
+                updatedPersonas.push(personaWithTs);
               }
               
+              const updatedHistories = (storageConfig.chatHistories || []).map(h => {
+                if (h.userPersonaId === newPersona.id) {
+                  return {
+                    ...h,
+                    userPersonaName: newPersona.name,
+                    userPersonaAvatar: newPersona.avatar || '',
+                    userPersonaDesc: newPersona.description || '',
+                    updatedAt: Date.now()
+                  };
+                }
+                return h;
+              });
+
               if (newPersona.isDefault) {
                 updatedPersonas = updatedPersonas.map(p => ({
                   ...p,
@@ -1868,11 +1978,25 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
                 }));
                 onUpdateConfig({ 
                   userPersonas: updatedPersonas,
-                  activeUserPersonaId: newPersona.id 
+                  activeUserPersonaId: newPersona.id,
+                  chatHistories: updatedHistories
                 });
               } else {
-                onUpdateConfig({ userPersonas: updatedPersonas });
+                onUpdateConfig({ 
+                  userPersonas: updatedPersonas,
+                  chatHistories: updatedHistories
+                });
               }
+
+              for (const h of updatedHistories.filter(x => x.userPersonaId === newPersona.id).slice(0, 5)) {
+                saveUserPersonaToChat(h.id, {
+                  id: newPersona.id,
+                  name: newPersona.name,
+                  avatar: newPersona.avatar,
+                  description: newPersona.description
+                }).catch(() => {});
+              }
+
               setShowCreatePersona(false);
               setEditingUserPersona(null);
             }}
@@ -1882,7 +2006,7 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
       </AnimatePresence>
 
       {/* Main Top Profile Content Area (Non-Scrollable Top Profile Header) */}
-      <div className={`flex-none px-5 pt-5 pb-1 z-10 flex flex-col gap-3.5 ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#121214]'}`}>
+      <div className={`flex-none px-5 pt-[calc(env(safe-area-inset-top,0px)+1rem)] pb-1 z-10 flex flex-col gap-3.5 transition-colors ${isLight ? 'bg-[#F8F9FA]' : 'bg-[#121214]'}`}>
         {/* Top Header Row matching My Chats */}
         <div className="flex items-center justify-between font-sans">
           <div className="flex flex-col">
@@ -1913,6 +2037,21 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
               accountCreatedAt={storageConfig.accountCreatedAt}
               onClick={() => setShowOrbWallet(true)}
             />
+            <button 
+              type="button"
+              onClick={() => {
+                triggerHaptic();
+                setShowAdminAudio(true);
+              }}
+              className={`w-9 h-9 rounded-xl border flex items-center justify-center transition-all duration-300 active:scale-90 cursor-pointer ${
+                isLight 
+                  ? 'bg-purple-50 border-purple-200 text-purple-700 hover:bg-purple-100 shadow-[0_2px_8px_rgba(168,85,247,0.1)]' 
+                  : 'bg-purple-500/10 border-purple-500/30 text-purple-300 shadow-[0_2px_10px_rgba(168,85,247,0.2)] hover:bg-purple-500/20 hover:border-purple-500/40'
+              }`}
+              title="Admin Menu & Audio Testing"
+            >
+              <Sliders className="w-4.5 h-4.5" />
+            </button>
             <button 
               onClick={() => {
                 triggerHaptic();
@@ -2430,7 +2569,30 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
                   return (
                     <div
                       key={uPersona.id}
-                      onClick={() => onUpdateConfig({ activeUserPersonaId: isActive ? '' : uPersona.id })}
+                      onClick={() => {
+                        const nextId = isActive ? '' : uPersona.id;
+                        const updatedHistories = (storageConfig.chatHistories || []).map(h => ({
+                          ...h,
+                          userPersonaId: nextId || h.userPersonaId || '',
+                          userPersonaName: nextId ? uPersona.name : (h.userPersonaName || ''),
+                          userPersonaAvatar: nextId ? (uPersona.avatar || '') : (h.userPersonaAvatar || ''),
+                          userPersonaDesc: nextId ? (uPersona.description || '') : (h.userPersonaDesc || '')
+                        }));
+                        onUpdateConfig({ 
+                          activeUserPersonaId: nextId,
+                          chatHistories: updatedHistories
+                        });
+                        if (nextId) {
+                          for (const h of (storageConfig.chatHistories || []).slice(0, 5)) {
+                            saveUserPersonaToChat(h.id, {
+                              id: uPersona.id,
+                              name: uPersona.name,
+                              avatar: uPersona.avatar,
+                              description: uPersona.description
+                            }).catch(() => {});
+                          }
+                        }
+                      }}
                       className="flex flex-col cursor-pointer group active:scale-[0.98] transition-all duration-300 relative animate-fadeIn"
                     >
                       {/* Visual container with border & shadow */}
@@ -2834,6 +2996,15 @@ export const ProfileScreen: React.FC<ProfileScreenProps> = React.memo(({
         onClose={() => setShowOrbWallet(false)}
         storageConfig={storageConfig}
         onUpdateConfig={onUpdateConfig}
+      />
+
+      {/* Admin Menu & Audio Testing Modal */}
+      <AdminAudioModal
+        isOpen={showAdminAudio}
+        onClose={() => setShowAdminAudio(false)}
+        storageConfig={storageConfig}
+        onUpdateConfig={onUpdateConfig}
+        theme={theme}
       />
 
     </div>

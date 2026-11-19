@@ -272,6 +272,25 @@ export async function getAsset(ref: string): Promise<string | null> {
   }
 }
 
+export async function resolveAudioSrcForPlayback(rawSrc: string | null | undefined): Promise<string | null> {
+  if (!rawSrc) return null;
+  const asset = await getAsset(rawSrc);
+  if (!asset || asset.startsWith('db:')) return null;
+
+  // On iOS / WebKit, large base64 data URLs fail to play in HTMLAudioElement.
+  // Converting data:audio/... to a Blob Object URL resolves this perfectly.
+  if (asset.startsWith('data:audio/') || (asset.startsWith('data:') && asset.length > 30000)) {
+    try {
+      const blob = await dataUrlToBlob(asset);
+      return URL.createObjectURL(blob);
+    } catch {
+      return asset;
+    }
+  }
+
+  return asset;
+}
+
 export async function deleteAsset(ref: string): Promise<boolean> {
   if (!ref) return true;
   if (assetCache.has(ref)) {
